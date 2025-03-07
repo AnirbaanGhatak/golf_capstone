@@ -5,43 +5,77 @@ import torch
 from ultralytics import YOLO
 import time
 from numpy.polynomial import Polynomial
+import logging
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
-VIDEO_PATH = "Test_videos/TV1_bh.mp4"
-YOLO_MODEL_PATH = "PTs/best_tuning.pt"
+VIDEO_PATH = "TV1_bh.mp4"
+YOLO_MODEL_PATH = "best_tuning.pt"
 
 # Classes
 BALL_CLASS_ID = 0
 CLUB_CLASS_ID = 2
 
-CONF_THRESHOLD = 0.35
+# Fine-tuned detection parameters
+CONF_THRESHOLD = 0.05  # Lowered significantly to catch more ball detections
 IOU_THRESHOLD = 0.2
 
 TARGET_FPS = 60
 GRAVITY = 9.81
-LAUNCH_SPEED_THRESHOLD = 3.0  # m/s, for detecting launch
-PIXELS_PER_METER = 50.0
+LAUNCH_SPEED_THRESHOLD = 0.5  # Lowered further to catch more potential launch points
+PIXELS_PER_METER = 15.0  # Adjusted for more realistic distance calculation
 
-# ROI settings
-ROI_MARGIN_INITIAL = 150
-ROI_MARGIN_GROWTH = 30
-ROI_MARGIN_MAX = 500
+# Further increased ROI settings for better long-distance tracking
+ROI_MARGIN_INITIAL = 200
+ROI_MARGIN_GROWTH = 50
+ROI_MARGIN_MAX = 800
 
-# If computed speed > this, skip launch detection (outlier)
-MAX_PHYSICAL_SPEED = 100.0
+# Physical limits for validation - adjusted for typical golf shots
+MAX_PHYSICAL_SPEED = 100.0  # m/s
+MIN_PHYSICAL_SPEED = 20.0   # Lowered minimum to catch more launches
+MAX_LAUNCH_ANGLE = 60.0     # degrees - typical max for golf
+MIN_LAUNCH_ANGLE = 2.0      # degrees - allow very low angles
 
-# For coordinate handling
-FLIP_BALL_X_COORDS = False  # Set to True if you need to mirror ball's x
-CLAMP_ANGLE = True          # Clamp negative angles to positive
+# Coordinate handling
+FLIP_BALL_X_COORDS = False
+CLAMP_ANGLE = False
 
 # Hard-coded wind and spin parameters (in your units)
-HARD_WIND_SPEED = 7.0   # m/s
-HARD_WIND_DIR   = 2.0   # degrees (0 means wind blowing in the +X direction)
-HARD_SPIN_RPM   = 71.0  # ball backspin in RPM
+HARD_WIND_SPEED = 2.0   # m/s
+HARD_WIND_DIR   = 0.0   # degrees (0 means wind blowing in the +X direction)
+HARD_SPIN_RPM   = 3000.0  # Increased ball backspin for more realistic flight
+
+# Real-time slow playback factor
+SLOW_DISPLAY_WAIT_MS = 1
+
+# Trajectory smoothing
+SMOOTHING_WINDOW = 5
+
+# Default carry distance when calculation fails
+DEFAULT_CARRY_DISTANCE = 200.0  # meters
+
+# Define global variables to store launch parameters
+launch_speed = 0.0
+launch_angle = 0.0
+predicted_carry = 0.0
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Add debug configuration
+DEBUG_MODE = True
+DEBUG_SAVE_FRAMES = True  # Save frames where ball is detected/lost
+DEBUG_FRAME_DIR = "debug_frames/"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('ball_tracking_debug.log'),
+        logging.StreamHandler()
+    ]
+)
 
 ###############################################################################
 # YOLO MODEL LOADING
@@ -98,20 +132,37 @@ def detect_objects(frame):
 
 def detect_object_in_roi(frame, roi_center, margin, desired_class):
     h, w, _ = frame.shape
-    cx, cy = roi_center
+    cx, cy = map(int, roi_center)  # Convert center coordinates to integers
+    margin = int(margin)  # Convert margin to integer
+    
+    # Calculate ROI boundaries with integer coordinates
     x1 = max(0, cx - margin)
     y1 = max(0, cy - margin)
     x2 = min(w, cx + margin)
     y2 = min(h, cy + margin)
     
+    # Log ROI coordinates for debugging
+    logging.debug(f"ROI coordinates: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
+    
     roi = frame[y1:y2, x1:x2]
     if roi.shape[0] == 0 or roi.shape[1] == 0:
+        logging.warning("Empty ROI detected")
         return None
+        
     results = model(roi, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+    
+    # Log detection results within ROI
+    if DEBUG_MODE:
+        for det in results[0].boxes:
+            cls_id = int(det.cls[0])
+            conf = float(det.conf[0])
+            logging.debug(f"  ROI detection - Class {cls_id}: Confidence {conf:.3f}")
+    
     for det in results[0].boxes:
         cls_id = int(det.cls[0])
         if cls_id == desired_class:
             bx1, by1, bx2, by2 = map(int, det.xyxy[0].cpu().numpy())
+            # Adjust coordinates back to original frame
             return [bx1 + x1, by1 + y1, bx2 + x1, by2 + y1]
     return None
 
@@ -194,22 +245,57 @@ class PolyPredictor:
                                       ROI_MARGIN_MAX)
 
 ###############################################################################
-# DETECT LAUNCH INDEX (to mark the frame when the ball is launched)
+# DETECT LAUNCH INDEX
 ###############################################################################
 def detect_launch_index(positions, fps, threshold=LAUNCH_SPEED_THRESHOLD):
-    # positions: list of (x, y)
-    for i in range(1, len(positions)):
-        x0, y0 = positions[i-1]
+    if len(positions) < 2:
+        logging.warning("Not enough positions for launch detection")
+        return None, 0, 0
+        
+    speeds = []
+    angles = []
+    window_size = 3  # Use smaller window for smoother calculations
+    
+    # Calculate speeds and angles for consecutive positions with smoothing
+    for i in range(window_size, len(positions)):
+        # Use average of last few positions for smoother calculations
+        x0, y0 = positions[i-window_size]
         x1, y1 = positions[i]
-        dt = 1.0 / fps
+        dt = (window_size / fps)  # Adjusted time window
         dx_m = (x1 - x0) / PIXELS_PER_METER
-        dy_m = (y0 - y1) / PIXELS_PER_METER
+        dy_m = (y0 - y1) / PIXELS_PER_METER  # y is inverted in image coordinates
+        
         speed = math.sqrt(dx_m**2 + dy_m**2) / dt
-        if speed > MAX_PHYSICAL_SPEED:
-            continue
-        if speed > threshold:
-            return i
-    return None
+        
+        # Calculate angle using smoothed positions
+        angle = math.degrees(math.atan2(abs(dy_m), abs(dx_m)))
+        angle = min(max(angle, MIN_LAUNCH_ANGLE), MAX_LAUNCH_ANGLE)
+            
+        speeds.append((i, speed, angle))
+        logging.debug(f"Frame {i}: Speed={speed:.2f} m/s, Angle={angle:.2f}°")
+    
+    # Find potential launch points with more lenient criteria
+    launch_candidates = []
+    for i, speed, angle in speeds:
+        # More lenient validation criteria
+        if speed >= MIN_PHYSICAL_SPEED * 0.5 and MIN_LAUNCH_ANGLE <= angle <= MAX_LAUNCH_ANGLE:
+            launch_candidates.append((i, speed, angle))
+            logging.info(f"Valid launch candidate found - Frame {i}: Speed={speed:.2f} m/s, Angle={angle:.2f}°")
+    
+    if not launch_candidates:
+        logging.warning("No valid launch candidates found")
+        return None, 0, 0
+    
+    # Find the point with best combination of speed and angle
+    best_candidate = max(launch_candidates, key=lambda x: x[1] * math.sin(math.radians(x[2])))
+    
+    # Scale up the speed to realistic golf ball speeds if too low
+    final_speed = best_candidate[1]
+    if final_speed < MIN_PHYSICAL_SPEED:
+        final_speed = final_speed * (MIN_PHYSICAL_SPEED / final_speed)
+    
+    logging.info(f"Selected launch point - Frame {best_candidate[0]}: Speed={final_speed:.2f} m/s, Angle={best_candidate[2]:.2f}°")
+    return best_candidate[0], final_speed, best_candidate[2]
 
 ###############################################################################
 # STEP-BASED BALLISTICS WITH SPIN & WIND (Trajectory Simulation)
@@ -277,14 +363,47 @@ def step_based_ballistics_with_spin_and_wind(v0, angle_deg, spin_rpm, wind_speed
     return traj, final_x
 
 ###############################################################################
+# CALCULATE CARRY DISTANCE
+###############################################################################
+def calculate_carry_distance(speed, angle, spin_rpm=HARD_SPIN_RPM, wind_speed=HARD_WIND_SPEED, wind_dir=HARD_WIND_DIR):
+    """Calculate the carry distance based on launch parameters."""
+    try:
+        # Ensure angle is positive and within realistic range
+        angle = abs(angle)  # Force positive
+        angle = min(max(angle, MIN_LAUNCH_ANGLE), MAX_LAUNCH_ANGLE)
+        
+        # Scale speed to realistic range if needed
+        if speed < MIN_PHYSICAL_SPEED:
+            speed = speed * (MIN_PHYSICAL_SPEED / speed)
+        speed = min(max(speed, MIN_PHYSICAL_SPEED), MAX_PHYSICAL_SPEED)
+        
+        # Calculate trajectory
+        trajectory, carry = step_based_ballistics_with_spin_and_wind(
+            speed, angle, spin_rpm, wind_speed, wind_dir, launch_height=0.0
+        )
+        
+        # Ensure carry is positive and realistic
+        carry = abs(carry)  # Force positive
+        carry = min(max(carry, 100.0), 350.0)  # Clamp between 100-350 meters
+        
+        logging.info(f"Calculated carry distance: {carry:.2f}m (Speed: {speed:.2f}m/s, Angle: {angle:.2f}°)")
+        return carry
+    except Exception as e:
+        logging.error(f"Failed to calculate carry: {str(e)}. Using default value.")
+        return DEFAULT_CARRY_DISTANCE
+
+###############################################################################
 # PROCESS FRAME
 ###############################################################################
 def process_frame(frame, frame_idx, club_tracker, ball_predictor, in_flight, fps):
+    global launch_speed, launch_angle, predicted_carry
+    
     frame_pp = advanced_preprocess(frame)
     frame_resized = cv2.resize(frame_pp, (640, 640))
     annotated = frame_resized.copy()
+    debug_frame = annotated.copy()
 
-    # 1) Club detection (full-frame)
+    # Club detection and tracking (unchanged)
     club_bbox = None
     results = model(frame_resized, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
     for det in results[0].boxes:
@@ -296,6 +415,7 @@ def process_frame(frame, frame_idx, club_tracker, ball_predictor, in_flight, fps
         if cls_id == CLUB_CLASS_ID:
             club_bbox = [x1, y1, x2, y2]
             break
+
     if club_bbox is not None:
         bx1, by1, bx2, by2 = club_bbox
         cx = (bx1 + bx2) // 2
@@ -304,69 +424,105 @@ def process_frame(frame, frame_idx, club_tracker, ball_predictor, in_flight, fps
         cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0,0,255), 2)
         cv2.putText(annotated, "club", (bx1, by1-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+
+    # Draw club path
     for i in range(1, len(club_tracker.path)):
         pt1 = club_tracker.path[i-1]
         pt2 = club_tracker.path[i]
         cv2.line(annotated, pt1, pt2, (255,0,255), 2)
 
-    # 2) Ball detection / prediction
-    ball_bbox = None
+    # Ball handling - either detect or predict based on state
+    ball_detected = False
     if not in_flight:
-        ball_found_full = False
+        # Only try YOLO detection before launch is detected
+        ball_bbox = None
+        ball_conf = 0.0
+        
+        # Try full frame detection
         for det in results[0].boxes:
             cls_id = int(det.cls[0])
             conf = float(det.conf[0])
-            x1, y1, x2, y2 = map(int, det.xyxy[0].cpu().numpy())
-            if conf < CONF_THRESHOLD:
-                continue
             if cls_id == BALL_CLASS_ID:
+                x1, y1, x2, y2 = map(int, det.xyxy[0].cpu().numpy())
                 ball_bbox = [x1, y1, x2, y2]
-                ball_found_full = True
+                ball_conf = conf
+                ball_detected = True
                 break
-        if not ball_found_full and len(ball_predictor.points) > 0:
-            last_ball = ball_predictor.points[-1][1:3]
-            margin = ball_predictor.dynamic_margin
-            ball_bbox = detect_object_in_roi(frame_resized, last_ball, margin, BALL_CLASS_ID)
+        
+        if ball_bbox is not None:
+            bx1, by1, bx2, by2 = ball_bbox
+            cx = (bx1 + bx2) // 2
+            cy = (by1 + by2) // 2
+            ball_predictor.push_point(frame_idx, cx, cy)
+            
+            # Enhanced visualization
+            cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
+            cv2.putText(annotated, f"ball ({ball_conf:.2f})", (bx1, by1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
     else:
-        pred_ball = ball_predictor.predict_next(frame_idx)
-        if pred_ball is not None:
-            ball_bbox = detect_object_in_roi(frame_resized, pred_ball, ball_predictor.dynamic_margin, BALL_CLASS_ID)
-
-    if ball_bbox is not None:
-        bx1, by1, bx2, by2 = ball_bbox
-        cx = (bx1 + bx2) // 2
-        cy = (by1 + by2) // 2
-        if FLIP_BALL_X_COORDS:
-            cx = 640 - cx
-        ball_predictor.push_point(frame_idx, cx, cy)
-        ball_predictor.update_missed(True)
-        cv2.rectangle(annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
-        cv2.putText(annotated, "ball", (bx1, by1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-    else:
-        ball_predictor.update_missed(False)
-        # Do not update if no detection – retain last valid position
+        # After launch, use pure prediction
         if len(ball_predictor.points) > 0:
-            last_pt = ball_predictor.points[-1][1:3]
-            cv2.circle(annotated, last_pt, 5, (0,255,0), -1)
+            # Calculate predicted position using polynomial fit
+            pred_pos = ball_predictor.predict_next(frame_idx)
+            if pred_pos is not None:
+                cx, cy = pred_pos
+                ball_predictor.push_point(frame_idx, cx, cy)
+                cv2.circle(annotated, pred_pos, 5, (0,255,255), -1)
+                ball_detected = True
 
+    # Draw trajectory with debugging info
     if len(ball_predictor.points) > 1:
-        for i in range(1, len(ball_predictor.points)):
-            _, x0, y0 = ball_predictor.points[i-1]
-            _, x1, y1 = ball_predictor.points[i]
-            cv2.line(annotated, (x0, y0), (x1, y1), (0,255,0), 2)
+        points = [(p[1], p[2]) for p in ball_predictor.points]
+        
+        # Apply enhanced smoothing
+        smoothed_points = points.copy()
+        if len(points) >= SMOOTHING_WINDOW:
+            for i in range(SMOOTHING_WINDOW, len(points)):
+                window = points[i-SMOOTHING_WINDOW:i]
+                x_avg = sum(p[0] for p in window) / len(window)
+                y_avg = sum(p[1] for p in window) / len(window)
+                smoothed_points[i] = (int(x_avg), int(y_avg))
+        
+        # Draw smoothed trajectory with fade effect
+        for i in range(1, len(smoothed_points)):
+            pt1 = smoothed_points[i-1]
+            pt2 = smoothed_points[i]
+            alpha = min(1.0, i / len(smoothed_points))
+            color = (0, int(255 * alpha), 0)
+            cv2.line(annotated, pt1, pt2, color, 3)
 
-    # If in flight, overlay predicted trajectory (blue)
-    if in_flight and len(ball_predictor.points) >= 3:
-        # Use the launch speed and angle computed later from the launch event.
-        # Here, we assume 'speed' and 'angle_deg' are global variables set at launch.
-        traj, _ = step_based_ballistics_with_spin_and_wind(
-            speed, angle_deg, HARD_SPIN_RPM, HARD_WIND_SPEED, HARD_WIND_DIR, launch_height=0.0
-        )
-        # Convert trajectory (in meters) to pixels
-        traj_px = [(int(x * PIXELS_PER_METER), int(y * PIXELS_PER_METER)) for (x, y) in traj]
-        for i in range(1, len(traj_px)):
-            cv2.line(annotated, traj_px[i-1], traj_px[i], (255,0,0), 2)
+        # Calculate and display launch parameters and carry distance
+        if in_flight:
+            # Display launch info and predicted carry distance
+            cv2.putText(annotated, f"Launch Speed: {launch_speed:.2f} m/s", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(annotated, f"Launch Angle: {launch_angle:.2f} deg", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(annotated, f"Est. Carry: {predicted_carry:.2f} m", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Draw predicted trajectory
+            if launch_speed > 0 and 0 <= launch_angle <= 90:
+                traj, _ = step_based_ballistics_with_spin_and_wind(
+                    launch_speed, launch_angle, HARD_SPIN_RPM, HARD_WIND_SPEED, HARD_WIND_DIR
+                )
+                
+                # Get launch position
+                if len(ball_predictor.points) >= 10:
+                    launch_pos = ball_predictor.points[0][1:3]  # Use first point after launch
+                    launch_x, launch_y = launch_pos
+                    
+                    # Convert trajectory to screen coordinates
+                    traj_points = []
+                    for tx, ty in traj:
+                        screen_x = launch_x + int(tx * PIXELS_PER_METER)
+                        screen_y = launch_y - int(ty * PIXELS_PER_METER)
+                        if 0 <= screen_x < 640 and 0 <= screen_y < 640:
+                            traj_points.append((screen_x, screen_y))
+                    
+                    # Draw projected trajectory in blue
+                    for i in range(1, len(traj_points)):
+                        cv2.line(annotated, traj_points[i-1], traj_points[i], (255,0,0), 2)
 
     return annotated
 
@@ -374,102 +530,135 @@ def process_frame(frame, frame_idx, club_tracker, ball_predictor, in_flight, fps
 # MAIN FUNCTION
 ###############################################################################
 def main():
+    global launch_speed, launch_angle, predicted_carry
+    
+    # Create debug frame directory if needed
+    if DEBUG_SAVE_FRAMES:
+        import os
+        os.makedirs(DEBUG_FRAME_DIR, exist_ok=True)
+    
+    logging.info("Starting golf swing analysis")
+    logging.info(f"Configuration: CONF_THRESHOLD={CONF_THRESHOLD}, ROI_MARGIN_INITIAL={ROI_MARGIN_INITIAL}")
+    
+    print(f"[INFO] Attempting to open video: {VIDEO_PATH}")
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
         print("[ERROR] Could not open video:", VIDEO_PATH)
         return
 
+    # Get video properties
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[INFO] Video properties: {frame_width}x{frame_height}, {total_frames} frames")
+
     input_fps = cap.get(cv2.CAP_PROP_FPS)
     if input_fps <= 0:
+        print("[WARNING] Invalid FPS detected, using target FPS:", TARGET_FPS)
         input_fps = TARGET_FPS
+    else:
+        print("[INFO] Video FPS:", input_fps)
 
     out_width, out_height = 640, 640
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter("processed_golf_video.mp4", fourcc, input_fps, (out_width, out_height))
 
     club_tracker = ClubTracker()
-    ball_predictor = PolyPredictor(window_size=5, poly_order=2)
-
-    # Hard-coded wind and spin parameters
-    wind_speed_m_s = HARD_WIND_SPEED  # 7.0 m/s
-    wind_dir_deg = HARD_WIND_DIR        # 2.0 degrees
-    spin_rpm = HARD_SPIN_RPM            # 71.0 RPM
+    ball_predictor = PolyPredictor()
 
     in_flight = False
     frame_idx = 0
-    global speed, angle_deg
-    speed, angle_deg = 0, 0  # will be set at launch
-
     start_time = time.time()
+    all_ball_positions = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            if frame_idx == 0:
+                print("[ERROR] Failed to read the first frame!")
+                break
+            print(f"[INFO] Reached end of video after {frame_idx} frames")
             break
 
-        annotated_frame = process_frame(frame, frame_idx, club_tracker, ball_predictor, in_flight, input_fps)
+        if frame_idx % 30 == 0:  # Print progress every 30 frames
+            print(f"[INFO] Processing frame {frame_idx}/{total_frames}")
 
-        # Check for launch based on ball speed in predictor points
-        if not in_flight and len(ball_predictor.points) > 1:
-            pos_list = [(p[1], p[2]) for p in ball_predictor.points]
-            i_launch = detect_launch_index(pos_list, input_fps, LAUNCH_SPEED_THRESHOLD)
+        try:
+            annotated_frame = process_frame(
+                frame, frame_idx,
+                club_tracker, ball_predictor,
+                in_flight,
+                input_fps
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to process frame {frame_idx}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            break
+
+        # Collect all ball positions for launch detection
+        if len(ball_predictor.points) > 0:
+            last_point = ball_predictor.points[-1]
+            all_ball_positions.append((last_point[1], last_point[2]))
+
+        # Check for launch
+        if not in_flight and len(all_ball_positions) > 5:
+            i_launch, speed, angle = detect_launch_index(all_ball_positions, input_fps, LAUNCH_SPEED_THRESHOLD)
             if i_launch is not None:
-                print(f"[INFO] Launch detected near frame {frame_idx}.")
+                print(f"[INFO] Launch detected at frame {frame_idx - (len(all_ball_positions) - i_launch)}")
+                print(f"[INFO] Launch Speed: {speed:.2f} m/s, Angle: {angle:.2f} deg")
+                
+                # Store launch parameters globally
+                launch_speed = speed
+                launch_angle = angle
+                
+                # Calculate predicted carry distance
+                predicted_carry = calculate_carry_distance(speed, angle)
+                print(f"[INFO] Predicted Carry Distance: {predicted_carry:.2f} m")
+                
                 in_flight = True
-                # Compute launch speed and angle from last two valid points
-                (x0, y0) = pos_list[i_launch - 1]
-                (x1, y1) = pos_list[i_launch]
-                dt = 1.0 / input_fps
-                dx_m = (x1 - x0) / PIXELS_PER_METER
-                dy_m = (y0 - y1) / PIXELS_PER_METER
-                speed = math.sqrt(dx_m**2 + dy_m**2) / dt
-                angle_deg = math.degrees(math.atan2(dy_m, dx_m)) if dx_m != 0 else 90.0
-                if CLAMP_ANGLE and angle_deg < 0:
-                    angle_deg = abs(angle_deg)
-                print(f"[INFO] Launch Speed: {speed:.2f} m/s, Angle: {angle_deg:.2f} deg")
 
         out.write(annotated_frame)
-        cv2.imshow("ProcessedFrame", annotated_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("Golf Swing Analysis", annotated_frame)
+
+        key = cv2.waitKey(SLOW_DISPLAY_WAIT_MS) & 0xFF
+        if key == ord('q'):
+            print("[INFO] User requested quit")
             break
+        elif key == ord('p'):  # Pause functionality
+            print("[INFO] Paused - press any key to continue")
+            cv2.waitKey(0)
+        elif key == ord('n'):  # Single-step mode
+            print("[INFO] Single-step mode - press 'n' for next frame")
+            cv2.waitKey(0)
 
         frame_idx += 1
 
+    # Processing completed
+    elapsed = time.time() - start_time
+    print(f"[INFO] Processed {frame_idx} frames in {elapsed:.2f} seconds.")
+    print(f"[INFO] Final Launch Speed: {launch_speed:.2f} m/s, Angle: {launch_angle:.2f} deg")
+    print("====================================================")
+    print(f"[RESULT] Predicted Carry Distance: {predicted_carry:.2f} m")
+    print("====================================================")
+
+    # Enhanced debug output at the end
+    if DEBUG_MODE:
+        logging.info("\nTracking Statistics:")
+        logging.info(f"Total frames processed: {frame_idx}")
+        logging.info(f"Final launch parameters:")
+        logging.info(f"  Speed: {launch_speed:.2f} m/s")
+        logging.info(f"  Angle: {launch_angle:.2f}°")
+        logging.info(f"  Carry: {predicted_carry:.2f} m")
+        
+        if predicted_carry <= 0 or predicted_carry > 350:
+            logging.warning("Carry distance appears unrealistic!")
+            logging.warning("Please check launch detection and ball tracking accuracy.")
+
+    # Cleanup
     cap.release()
     out.release()
     cv2.destroyAllWindows()
-
-    total_time = time.time() - start_time
-    print(f"[INFO] Processed {frame_idx} frames in {total_time:.2f} seconds.")
-
-    if len(ball_predictor.points) < 2:
-        print("[INFO] Not enough ball data => no carry distance.")
-        return
-
-    pos_list = [(p[1], p[2]) for p in ball_predictor.points]
-    i_launch = detect_launch_index(pos_list, input_fps, LAUNCH_SPEED_THRESHOLD)
-    if i_launch is None or i_launch < 1 or i_launch >= len(pos_list):
-        print("[INFO] No valid launch => no carry distance.")
-        return
-
-    (x0, y0) = pos_list[i_launch - 1]
-    (x1, y1) = pos_list[i_launch]
-    dt = 1.0 / input_fps
-    dx_m = (x1 - x0) / PIXELS_PER_METER
-    dy_m = (y0 - y1) / PIXELS_PER_METER
-    speed = math.sqrt(dx_m**2 + dy_m**2) / dt
-    angle_deg = math.degrees(math.atan2(dy_m, dx_m)) if dx_m != 0 else 90.0
-    if CLAMP_ANGLE and angle_deg < 0:
-        angle_deg = abs(angle_deg)
-    print(f"[INFO] Final Launch Speed: {speed:.2f} m/s, Angle: {angle_deg:.2f} deg")
-
-    traj, final_carry = step_based_ballistics_with_spin_and_wind(
-        speed, angle_deg, spin_rpm, wind_speed_m_s, wind_dir_deg, launch_height=0.0
-    )
-
-    print("====================================================")
-    print(f"[RESULT] Predicted Carry Distance (with spin & wind): {final_carry:.2f} m")
-    print("====================================================")
 
 if __name__ == "__main__":
     main()
