@@ -1,3 +1,11 @@
+"""
+FlightSight Pro - Advanced Golf Shot Analysis System
+Dual-Angle Ball and Club Tracking with 3D Trajectory Reconstruction
+
+This system uses computer vision and machine learning to track golf shots from two camera angles,
+calculate shot parameters, and visualize the ball trajectory in 3D space.
+"""
+
 # GPU optimization
 import os
 # Set environment variables for optimal GPU performance
@@ -13,52 +21,46 @@ from ultralytics import YOLO
 import time
 from numpy.polynomial import Polynomial
 import logging
-import os
 import os.path
-from scipy.integrate import solve_ivp
 from scipy.spatial.transform import Rotation
-from IPython.display import display, clear_output
 import matplotlib.pyplot as plt
-from google.colab import files
-import glob
 from datetime import datetime
 import gc  # For manual garbage collection
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
-# Set to True if you want to upload videos directly through the notebook
+# Upload flag - set to False since we're using local files
 UPLOAD_VIDEOS = False
 
-# Video paths (will be updated after upload if UPLOAD_VIDEOS is True)
-FRONT_VIDEO_PATH = "/kaggle/input/new-videos/Test_videos/TV1_bh.mp4"    # Default path if using dataset
-SIDE_VIDEO_PATH = "/kaggle/input/new-videos/Test_videos/TV1_bs.mp4"   # Default path if using dataset
+# Video paths
+FRONT_VIDEO_PATH = "Test_videos/archive/TV2_bh.mp4"  # Behind golfer view
+SIDE_VIDEO_PATH = "Test_videos/archive/TV2_bs.mp4"    # Side view
 
 # YOLO model
-UPLOAD_MODEL = True  # Set to True to upload your YOLO model
-YOLO_MODEL_PATH = "/kaggle/input/tuning_pt/pytorch/default/1/best_tuning.pt"  # Default path if using dataset
+YOLO_MODEL_PATH = "PTs/best_tunning.pt"  # YOLO model
 
-# Classes
-BALL_CLASS_ID = 0
-CLUB_CLASS_ID = 2
+# Classes for YOLO
+BALL_CLASS_ID = 0    # Index for ball in your YOLO model
+CLUB_CLASS_ID = 2    # Index for club in your YOLO model
 
 # Detection parameters
-CONF_THRESHOLD = 0.05
+CONF_THRESHOLD = 0.38
 IOU_THRESHOLD = 0.2
 
-# Display control for Kaggle
-DISPLAY_FRAMES = False  # Set to False to disable frame display during processing
+# Display control
+DISPLAY_FRAMES = True  # Set to False to disable frame display during processing
 PROCESS_INTERVAL = 1    # Process every frame (set higher for faster preview)
 BATCH_SIZE = 1          # No batching
 
 # Target FPS for processing
-TARGET_FPS = 60
+TARGET_FPS = 30
 
 # Physical parameters
 GRAVITY = 9.81
 LAUNCH_SPEED_THRESHOLD = 0.5
-PIXELS_PER_METER_FRONT = 150.0  # Increased scaling factor
-PIXELS_PER_METER_SIDE = 150.0   # Increased scaling factor
+PIXELS_PER_METER_FRONT = 150.0  # Scaling factor
+PIXELS_PER_METER_SIDE = 150.0   # Scaling factor
 
 # Smash factor (ratio of ball speed to club head speed)
 SMASH_FACTOR = 1.48  # Typical driver smash factor
@@ -92,6 +94,16 @@ SIDESPIN_RPM = 0.0     # Initial sidespin
 # Default carry distance when calculation fails
 DEFAULT_CARRY_DISTANCE = 200.0  # meters
 
+SLOW_MOTION_FACTOR = 8.0  
+
+# Frame window adjustments for slow motion analysis
+FRAME_WINDOW_SIZE = int(5 * SLOW_MOTION_FACTOR)  # Wider window for trajectory analysis
+IMPACT_DETECTION_WINDOW = int(20 * SLOW_MOTION_FACTOR)  # More frames to detect impact
+
+# Detection thresholds adjusted for slower apparent movement
+MIN_CLUB_SPEED_THRESHOLD = 5.0 / SLOW_MOTION_FACTOR  # Lower threshold for swing detection
+MIN_MOVEMENT_THRESHOLD = 3.0 / SLOW_MOTION_FACTOR  # Smaller movement per frame threshold
+
 # Global variables to store launch parameters
 launch_speed = 0.0
 launch_angle_vertical = 0.0
@@ -100,14 +112,45 @@ predicted_carry = 0.0
 shot_direction = 1  # Default right direction
 club_speed = 0.0    # Club head speed
 
-# GPU configuration for Kaggle T4s - modified for stability
+# Camera calibration parameters
+CAMERA_MATRIX_FRONT = np.array([
+    [1000, 0, 320],  # fx, 0, cx
+    [0, 1000, 240],  # 0, fy, cy
+    [0, 0, 1]        # 0, 0, 1
+])
+
+CAMERA_MATRIX_SIDE = np.array([
+    [1000, 0, 320],  # fx, 0, cx
+    [0, 1000, 240],  # 0, fy, cy
+    [0, 0, 1]        # 0, 0, 1
+])
+
+# Camera offset (side camera position relative to front camera)
+# For golf analysis with perpendicular views, side camera ~3-5m to right
+CAMERA_OFFSET = np.array([5.0, 0.0, 0.0])  # X, Y, Z in meters
+
+# Debug configuration
+DEBUG_MODE = True
+DEBUG_SAVE_FRAMES = True
+DEBUG_FRAME_DIR = "debug_frames/"  # Local directory for debug frames
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()  # Just log to stdout for notebooks
+    ]
+)
+
+# GPU configuration for stability
 if torch.cuda.is_available():
     device_count = torch.cuda.device_count()
     if device_count > 1:
         print(f"Found {device_count} GPUs! Using primary GPU for stability.")
         for i in range(device_count):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-        # Use only the first GPU to avoid the batch size error with YOLOv8
+        # Use only the first GPU to avoid the batch size error with YOLO
         device = "0"  # Use single GPU for YOLO inference
     else:
         print(f"Found 1 GPU: {torch.cuda.get_device_name(0)}")
@@ -116,89 +159,77 @@ else:
     print("No GPU found. Using CPU.")
     device = "cpu"
 
-# Debug configuration
-DEBUG_MODE = True
-DEBUG_SAVE_FRAMES = True
-DEBUG_FRAME_DIR = "/tmp/debug_frames/"  # Use /tmp for Kaggle/Colab
-
-# Configure logging for Kaggle notebook
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Just log to stdout for Kaggle notebooks
-    ]
-)
-
 ###############################################################################
-# KAGGLE/COLAB SPECIFIC HELPER FUNCTIONS
+# DISPLAY HELPER FUNCTIONS
 ###############################################################################
-def upload_files():
-    """Allow user to upload video files and model through the notebook"""
-    global FRONT_VIDEO_PATH, SIDE_VIDEO_PATH, YOLO_MODEL_PATH
-    
-    print("Please upload the front view video:")
-    front_upload = files.upload()
-    if front_upload:
-        FRONT_VIDEO_PATH = next(iter(front_upload))
-        print(f"Front video uploaded: {FRONT_VIDEO_PATH}")
-    
-    print("Please upload the side view video:")
-    side_upload = files.upload()
-    if side_upload:
-        SIDE_VIDEO_PATH = next(iter(side_upload))
-        print(f"Side video uploaded: {SIDE_VIDEO_PATH}")
-    
-    if UPLOAD_MODEL:
-        print("Please upload the YOLO model weights (.pt file):")
-        model_upload = files.upload()
-        if model_upload:
-            YOLO_MODEL_PATH = next(iter(model_upload))
-            print(f"YOLO model uploaded: {YOLO_MODEL_PATH}")
 
-def display_frame_in_notebook(frame, figsize=(12, 8)):
-    """Display a frame in the Jupyter notebook"""
-    # Only display if explicitly enabled
-    if not DISPLAY_FRAMES:
-        return
-        
-    plt.figure(figsize=figsize)
-    plt.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    plt.axis('off')
-    plt.show()
+def draw_metrics_box(img, x, y, width, height, alpha=0.5):
+    """
+    Draw a semi-transparent background box for metrics display.
+    
+    Args:
+        img: OpenCV image to draw on
+        x, y: Top-left corner coordinates
+        width, height: Box dimensions
+        alpha: Transparency level (0-1)
+    """
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + width, y + height), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
 
 ###############################################################################
 # YOLO MODEL LOADING
 ###############################################################################
-model = None  # Will be initialized in main()
+
+# Global model variable
+model = None  
 
 def load_yolo_model():
+    """
+    Load the YOLO model and verify inference works.
+    Handles fallback to CPU if GPU inference fails.
+    """
     global model
-    # Load the model
-    model = YOLO(YOLO_MODEL_PATH)
-    model.fuse()
     
-    # Note: We no longer explicitly set the device as YOLO handles this automatically
-    logging.info(f"YOLO model loaded (will use {device} device)")
-    
-    # Test inference with small batch to verify everything works
+    # Load the YOLO model
     try:
+        model = YOLO(YOLO_MODEL_PATH)
+        # Fuse layers if available for better performance
+        if hasattr(model, 'fuse') and callable(getattr(model, 'fuse')):
+            model.fuse()
+        
+        logging.info(f"YOLO model loaded (will use {device} device)")
+        
+        # Test inference with small batch to verify everything works
         dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
         dummy_image_rgb = cv2.cvtColor(dummy_image, cv2.COLOR_BGR2RGB)
-        _ = model(dummy_image_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+        
+        # Handle potential API changes in YOLO
+        try:
+            # First try with standard YOLOv8-style params
+            _ = model(dummy_image_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+        except TypeError:
+            # Fall back to simpler params if API changed
+            _ = model(dummy_image_rgb, conf=CONF_THRESHOLD)
+            
         logging.info("YOLO model test inference successful")
     except Exception as e:
         logging.error(f"YOLO model test inference failed: {e}")
         logging.warning("Falling back to CPU if GPU inference fails")
         
-        # If GPU inference fails, we might try on CPU
+        # If GPU inference fails, try on CPU
         if device != "cpu" and torch.cuda.is_available():
             try:
                 # Try again with CPU
                 model = YOLO(YOLO_MODEL_PATH)
                 dummy_image = np.zeros((640, 640, 3), dtype=np.uint8)
                 dummy_image_rgb = cv2.cvtColor(dummy_image, cv2.COLOR_BGR2RGB)
-                _ = model(dummy_image_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, device="cpu")
+                try:
+                    _ = model(dummy_image_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, device="cpu")
+                except TypeError:
+                    _ = model(dummy_image_rgb, conf=CONF_THRESHOLD, device="cpu")
+                    
                 logging.info("YOLO model CPU inference successful (fallback)")
             except Exception as e2:
                 logging.error(f"YOLO model CPU inference also failed: {e2}")
@@ -208,19 +239,32 @@ def load_yolo_model():
 ###############################################################################
 # CAMERA CALIBRATION AND 3D RECONSTRUCTION
 ###############################################################################
-class CameraCalibration:
-    """Handles camera calibration and 3D reconstruction from multiple views"""
+
+class GolfCameraCalibration:
+    """
+    Enhanced camera calibration specifically for golf shot analysis with behind and side views.
+    Handles triangulation of 3D points from dual-view 2D coordinates.
+    """
     
     def __init__(self, camera_matrix_front, camera_matrix_side, camera_offset):
+        """
+        Initialize camera calibration with camera matrices and physical setup.
+        
+        Args:
+            camera_matrix_front: 3x3 intrinsic matrix for front camera
+            camera_matrix_side: 3x3 intrinsic matrix for side camera
+            camera_offset: 3D offset (x,y,z) of side camera relative to front
+        """
         self.camera_matrix_front = camera_matrix_front
         self.camera_matrix_side = camera_matrix_side
         self.camera_offset = camera_offset
         
-        # Define rotation matrices for each camera (initial estimate)
-        # Front camera looks straight at the golfer
+        # For golf shots, define orientation better:
+        # Front camera (behind golfer) looks down the target line
         self.R_front = np.eye(3)
         
-        # Side camera is rotated 90 degrees around the y-axis
+        # Side camera is rotated 90 degrees around y-axis to view from side
+        # For right-handed golf setup, side camera is typically on the right side
         self.R_side = Rotation.from_euler('y', -90, degrees=True).as_matrix()
         
         # Translation vectors
@@ -231,11 +275,11 @@ class CameraCalibration:
         self.P_front = self.camera_matrix_front @ np.hstack((self.R_front, self.t_front.reshape(3, 1)))
         self.P_side = self.camera_matrix_side @ np.hstack((self.R_side, self.t_side.reshape(3, 1)))
         
-        # Distance scaling factor to ensure realistic golf distances
-        # A golf shot with launch speed of ~20 m/s should travel ~150-200 meters
-        self.distance_scale_factor = 10.0
+        # For golf, we need appropriate scaling to ensure realistic distances
+        # A typical driver shot might travel 200-250 yards
+        self.distance_scale_factor = 15.0  # Adjusted for golf distances
         
-        logging.info("Camera calibration initialized with distance scaling factor")
+        logging.info("Golf-specific camera calibration initialized")
     
     def triangulate_point(self, point_front, point_side):
         """
@@ -272,32 +316,383 @@ class CameraCalibration:
         return point_3d
     
     def project_3d_to_front(self, point_3d):
-        """Project a 3D point onto the front view"""
+        """
+        Project a 3D point onto the front view.
+        
+        Args:
+            point_3d: 3D point (x, y, z)
+            
+        Returns:
+            tuple: (x, y) coordinates in front view
+        """
         point_3d_hom = np.append(point_3d, 1.0)
         point_front_hom = self.P_front @ point_3d_hom
         point_front = point_front_hom[:2] / point_front_hom[2]
         return point_front
     
     def project_3d_to_side(self, point_3d):
-        """Project a 3D point onto the side view"""
+        """
+        Project a 3D point onto the side view.
+        
+        Args:
+            point_3d: 3D point (x, y, z)
+            
+        Returns:
+            tuple: (x, y) coordinates in side view
+        """
         point_3d_hom = np.append(point_3d, 1.0)
         point_side_hom = self.P_side @ point_3d_hom
         point_side = point_side_hom[:2] / point_side_hom[2]
         return point_side
     
     def validate_3d_point(self, point_3d, max_distance=10.0):
-        """Check if a 3D point is valid (within reasonable range)"""
+        """
+        Check if a 3D point is valid (within reasonable range).
+        
+        Args:
+            point_3d: 3D point coordinates
+            max_distance: Maximum allowable distance from origin
+            
+        Returns:
+            bool: True if point is valid, False otherwise
+        """
         distance = np.linalg.norm(point_3d)
         return distance <= max_distance
 
 
 ###############################################################################
-# ENHANCED CLUB TRACKING
+# IMPROVED BALL DETECTION
 ###############################################################################
+
+def detect_ball_with_motion(frame, prev_frame, background_frame):
+    """
+    Detect the ball using motion and shape properties.
+    Uses frame differencing and logical AND to isolate moving ball.
+    
+    Args:
+        frame: Current frame
+        prev_frame: Previous frame
+        background_frame: Background model frame
+    
+    Returns:
+        tuple: (ball_position, confidence) or (None, 0.0) if no ball detected
+    """
+    if prev_frame is None or background_frame is None:
+        return None, 0.0
+    
+    try:
+        # Convert to grayscale for processing
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        bg_gray = cv2.cvtColor(background_frame, cv2.COLOR_BGR2GRAY)
+        
+        # Calculate frame differences
+        diff1 = cv2.absdiff(gray, prev_gray)
+        diff2 = cv2.absdiff(gray, bg_gray)
+        
+        # Threshold the differences
+        _, thresh1 = cv2.threshold(diff1, 25, 255, cv2.THRESH_BINARY)
+        _, thresh2 = cv2.threshold(diff2, 25, 255, cv2.THRESH_BINARY)
+        
+        # Logical AND to find regions present in both differences
+        combined = cv2.bitwise_and(thresh1, thresh2)
+        
+        # Apply morphological operations to clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        filtered = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Find the most ball-like contour (small, circular, fast-moving)
+        best_ball = None
+        best_conf = 0.0
+        
+        for contour in contours:
+            # Check size
+            area = cv2.contourArea(contour)
+            if area < 10 or area > 500:  # Too small or too large
+                continue
+            
+            # Check circularity
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            if circularity < 0.5:  # Not circular enough
+                continue
+            
+            # Calculate position
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            
+            # Calculate confidence based on circularity and size
+            confidence = circularity * min(1.0, area / 100.0)
+            
+            if confidence > best_conf:
+                best_ball = (cx, cy)
+                best_conf = confidence
+        
+        return best_ball, best_conf
+        
+    except Exception as e:
+        logging.error(f"Error in motion-based ball detection: {e}")
+        return None, 0.0
+
+
+###############################################################################
+# DETECTION FUNCTIONS
+###############################################################################
+
+def advanced_preprocess(frame):
+    """
+    Enhance frame for better object detection with contrast and edge enhancement.
+    
+    Args:
+        frame: Input OpenCV frame (BGR format)
+    
+    Returns:
+        Preprocessed frame or None if input is None
+    """
+    # Skip preprocessing if frame is None
+    if frame is None:
+        return None
+        
+    gamma = 1.2
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+    frame_gamma = cv2.LUT(frame, table)
+    
+    lab = cv2.cvtColor(frame_gamma, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    L_clahe = clahe.apply(L)
+    lab_clahe = cv2.merge((L_clahe, A, B))
+    frame_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+    
+    frame_denoised = cv2.GaussianBlur(frame_clahe, (3,3), 0)
+    blur = cv2.GaussianBlur(frame_denoised, (0,0), 3)
+    frame_sharp = cv2.addWeighted(frame_denoised, 1.5, blur, -0.5, 0)
+
+    hsv = cv2.cvtColor(frame_sharp, cv2.COLOR_BGR2HSV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    tophat = cv2.morphologyEx(hsv, cv2.MORPH_TOPHAT, kernel)
+    hsv_combined = cv2.addWeighted(hsv, 1.0, tophat, 0.5, 0)
+    processed = cv2.cvtColor(hsv_combined, cv2.COLOR_HSV2BGR)
+    return processed
+
+
+def detect_objects(frame):
+    """
+    Detect ball and club in a frame using YOLO.
+    
+    Args:
+        frame: Input frame for detection
+    
+    Returns:
+        tuple: (ball_bbox, ball_conf, club_bbox, club_conf) - bounding boxes and confidence scores
+    """
+    if frame is None:
+        return None, 0.0, None, 0.0
+        
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Handle potential API changes in YOLO
+    try:
+        # First try with standard YOLOv8-style params
+        results = model(frame_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+    except TypeError:
+        # Fall back to simpler params if API changed
+        results = model(frame_rgb, conf=CONF_THRESHOLD)
+    
+    ball_bbox = None
+    ball_conf = 0.0
+    club_bbox = None
+    club_conf = 0.0
+    
+    # Handle potential changes in results structure
+    try:
+        # Try standard YOLOv8 result format first
+        if hasattr(results[0], 'boxes'):
+            for det in results[0].boxes:
+                cls_id = int(det.cls[0])
+                conf = float(det.conf[0])
+                if conf < CONF_THRESHOLD:
+                    continue
+                    
+                x1, y1, x2, y2 = map(int, det.xyxy[0].cpu().numpy())
+                
+                if cls_id == BALL_CLASS_ID and conf > ball_conf:
+                    ball_bbox = [x1, y1, x2, y2]
+                    ball_conf = conf
+                elif cls_id == CLUB_CLASS_ID and conf > club_conf:
+                    club_bbox = [x1, y1, x2, y2]
+                    club_conf = conf
+        # Alternative structure that might be used in YOLO
+        elif hasattr(results, 'xyxy'):
+            for i, det in enumerate(results.xyxy[0]):
+                cls_id = int(det[-1])
+                conf = float(det[-2])
+                if conf < CONF_THRESHOLD:
+                    continue
+                    
+                x1, y1, x2, y2 = map(int, det[:4].cpu().numpy())
+                
+                if cls_id == BALL_CLASS_ID and conf > ball_conf:
+                    ball_bbox = [x1, y1, x2, y2]
+                    ball_conf = conf
+                elif cls_id == CLUB_CLASS_ID and conf > club_conf:
+                    club_bbox = [x1, y1, x2, y2]
+                    club_conf = conf
+        # If structure completely different, try to adapt
+        else:
+            logging.warning("Unrecognized YOLO result format - trying to adapt")
+            # Try to find detections in results
+            if hasattr(results, 'pred') and len(results.pred) > 0:
+                for det in results.pred[0]:
+                    if len(det) >= 6:  # x1,y1,x2,y2,conf,cls
+                        cls_id = int(det[5])
+                        conf = float(det[4])
+                        if conf < CONF_THRESHOLD:
+                            continue
+                            
+                        x1, y1, x2, y2 = map(int, det[:4].cpu().numpy())
+                        
+                        if cls_id == BALL_CLASS_ID and conf > ball_conf:
+                            ball_bbox = [x1, y1, x2, y2]
+                            ball_conf = conf
+                        elif cls_id == CLUB_CLASS_ID and conf > club_conf:
+                            club_bbox = [x1, y1, x2, y2]
+                            club_conf = conf
+    except Exception as e:
+        logging.error(f"Error parsing YOLO results: {e}")
+    
+    return ball_bbox, ball_conf, club_bbox, club_conf
+
+
+def detect_object_in_roi(frame, roi_center, margin, desired_class):
+    """
+    Detect a specific object within a region of interest using YOLO.
+    
+    Args:
+        frame: Input frame
+        roi_center: (x, y) center of ROI
+        margin: Pixel margin around center to define ROI
+        desired_class: Class ID to detect
+    
+    Returns:
+        tuple: (bbox, confidence) - Bounding box and confidence score, or (None, 0.0) if not found
+    """
+    try:
+        if frame is None or roi_center is None:
+            return None, 0.0
+            
+        h, w, _ = frame.shape
+        cx, cy = map(int, roi_center)
+        margin = int(margin)
+        
+        # Calculate ROI boundaries
+        x1 = max(0, cx - margin)
+        y1 = max(0, cy - margin)
+        x2 = min(w, cx + margin)
+        y2 = min(h, cy + margin)
+        
+        # Ensure ROI is valid
+        if x2 <= x1 or y2 <= y1:
+            logging.warning(f"Invalid ROI dimensions: width={x2-x1}, height={y2-y1}")
+            return None, 0.0
+        
+        roi = frame[y1:y2, x1:x2]
+        if roi.shape[0] == 0 or roi.shape[1] == 0:
+            logging.warning("Empty ROI detected")
+            return None, 0.0
+        
+        # Convert BGR to RGB for YOLO
+        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        
+        # Run detection on ROI with YOLO compatibility
+        try:
+            # Try standard params first
+            results = model(roi_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+        except TypeError:
+            # Fall back to simpler params if API changed
+            results = model(roi_rgb, conf=CONF_THRESHOLD)
+        
+        # Find best match for desired class
+        best_det = None
+        best_conf = -1
+        
+        # Handle potential changes in results structure
+        try:
+            # Standard YOLOv8 format
+            if hasattr(results[0], 'boxes'):
+                for det in results[0].boxes:
+                    cls_id = int(det.cls[0])
+                    conf = float(det.conf[0])
+                    
+                    if cls_id == desired_class and conf > best_conf:
+                        best_det = det
+                        best_conf = conf
+                
+                if best_det is not None:
+                    bx1, by1, bx2, by2 = map(int, best_det.xyxy[0].cpu().numpy())
+                    # Adjust coordinates back to original frame
+                    return [bx1 + x1, by1 + y1, bx2 + x1, by2 + y1], best_conf
+            
+            # Alternative YOLO format
+            elif hasattr(results, 'xyxy'):
+                for i, det in enumerate(results.xyxy[0]):
+                    cls_id = int(det[-1])
+                    conf = float(det[-2])
+                    
+                    if cls_id == desired_class and conf > best_conf:
+                        best_conf = conf
+                        x1_roi, y1_roi, x2_roi, y2_roi = map(int, det[:4].cpu().numpy())
+                        # Adjust coordinates back to original frame
+                        return [x1_roi + x1, y1_roi + y1, x2_roi + x1, y2_roi + y1], best_conf
+            
+            # Try to adapt to other potential formats
+            else:
+                logging.warning("Unrecognized YOLO result format in ROI detection")
+                # Try to find detections in results
+                if hasattr(results, 'pred') and len(results.pred) > 0:
+                    for det in results.pred[0]:
+                        if len(det) >= 6:  # x1,y1,x2,y2,conf,cls
+                            cls_id = int(det[5])
+                            conf = float(det[4])
+                            
+                            if cls_id == desired_class and conf > best_conf:
+                                best_conf = conf
+                                x1_roi, y1_roi, x2_roi, y2_roi = map(int, det[:4].cpu().numpy())
+                                # Adjust coordinates back to original frame
+                                return [x1_roi + x1, y1_roi + y1, x2_roi + x1, y2_roi + y1], best_conf
+        
+        except Exception as e:
+            logging.error(f"Error parsing YOLO ROI results: {e}")
+        
+        return None, 0.0
+        
+    except Exception as e:
+        logging.error(f"Error in ROI detection: {str(e)}")
+        return None, 0.0
+
+
+###############################################################################
+# CLUB TRACKING CLASSES
+###############################################################################
+
 class EnhancedClubTracker:
-    """Improved club tracker with temporal filtering and noise reduction"""
+    """
+    Improved club tracker with temporal filtering and noise reduction.
+    """
     
     def __init__(self):
+        """Initialize club tracker with filtering parameters."""
         self.raw_path = []     # Raw club positions (x, y, confidence)
         self.filtered_path = [] # Filtered club positions
         self.velocity = []     # Club head velocity for smash factor calculation
@@ -306,7 +701,13 @@ class EnhancedClubTracker:
         self.confidence_threshold = 0.3  # Minimum confidence to accept detection
     
     def update(self, x, y, confidence=1.0):
-        """Add new club position with temporal filtering"""
+        """
+        Add new club position with temporal filtering.
+        
+        Args:
+            x, y: Club position coordinates
+            confidence: Detection confidence (0-1)
+        """
         # Skip if position is None
         if x is None or y is None:
             return
@@ -356,7 +757,15 @@ class EnhancedClubTracker:
                 self.filtered_path.append((int(x), int(y)))
     
     def is_significant_movement(self, x, y):
-        """Check if movement from last position is significant"""
+        """
+        Check if movement from last position is significant.
+        
+        Args:
+            x, y: Current position coordinates
+            
+        Returns:
+            bool: True if movement is significant, False otherwise
+        """
         if not self.filtered_path:
             return True
         
@@ -365,11 +774,24 @@ class EnhancedClubTracker:
         return distance >= self.min_movement_threshold
     
     def get_path(self):
-        """Get filtered club path"""
+        """
+        Get filtered club path.
+        
+        Returns:
+            list: List of (x, y) coordinates representing the club path
+        """
         return self.filtered_path
     
     def get_average_velocity(self, n_samples=5):
-        """Calculate average velocity from recent samples"""
+        """
+        Calculate average velocity from recent samples.
+        
+        Args:
+            n_samples: Number of recent samples to average
+            
+        Returns:
+            tuple: (avg_vx, avg_vy) - Average velocity components
+        """
         if len(self.velocity) < n_samples:
             return (0, 0)
         
@@ -379,57 +801,96 @@ class EnhancedClubTracker:
         return (avg_vx, avg_vy)
     
     def get_club_speed(self, fps, pixels_per_meter):
-        """Calculate club head speed in m/s"""
+        """
+        Calculate club head speed with slow motion compensation.
+        
+        Args:
+            fps: Frame rate of slow motion video
+            pixels_per_meter: Conversion factor from pixels to meters
+            
+        Returns:
+            float: Club speed in m/s (real-world value)
+        """
         if len(self.velocity) < 3:
             return 0.0
         
-        # Use most recent velocity samples
+        # Calculate average velocity from recent samples
         recent = self.velocity[-3:]
         avg_vx = sum(v[0] for v in recent) / len(recent)
         avg_vy = sum(v[1] for v in recent) / len(recent)
         
-        # Convert to m/s
+        # Convert to m/s with slow motion compensation
         speed_pixels = (avg_vx**2 + avg_vy**2)**0.5
-        speed_m_s = speed_pixels / pixels_per_meter * fps
+        speed_m_s = speed_pixels / pixels_per_meter * fps * SLOW_MOTION_FACTOR
         return speed_m_s
     
     def is_in_backswing(self):
-        """Determine if club is in backswing phase"""
-        if len(self.filtered_path) < 5:
+        """
+        Determine if club is in backswing phase, with slow motion adjustments.
+        
+        Returns:
+            bool: True if in backswing, False otherwise
+        """
+        # Use wider window for slow motion detection
+        window_size = FRAME_WINDOW_SIZE
+        if len(self.filtered_path) < window_size:
             return False
         
-        # For right-handed golfer, backswing often moves right and up
-        recent = self.filtered_path[-5:]
+        # Analyze movement over window
+        recent = self.filtered_path[-window_size:]
         start_x, start_y = recent[0]
         end_x, end_y = recent[-1]
         
-        # Moving right and up (screen coordinates)
+        # Calculate movement
         dx = end_x - start_x
         dy = end_y - start_y
         
-        return dx > 10 and dy < -10
+        # Scaled thresholds for slow motion
+        threshold_x = 10 / SLOW_MOTION_FACTOR  # Right movement threshold
+        threshold_y = -10 / SLOW_MOTION_FACTOR  # Upward movement threshold
+        
+        return dx > threshold_x and dy < threshold_y
     
     def is_in_downswing(self):
-        """Determine if club is in downswing phase"""
-        if len(self.filtered_path) < 5:
+        """
+        Determine if club is in downswing phase, with slow motion adjustments.
+        
+        Returns:
+            bool: True if in downswing, False otherwise
+        """
+        # Use wider window for slow motion detection
+        window_size = FRAME_WINDOW_SIZE
+        if len(self.filtered_path) < window_size:
             return False
         
-        # For right-handed golfer, downswing often moves left and down
-        recent = self.filtered_path[-5:]
+        # Analyze movement over window
+        recent = self.filtered_path[-window_size:]
         start_x, start_y = recent[0]
         end_x, end_y = recent[-1]
         
-        # Moving left and down (screen coordinates)
+        # Calculate movement
         dx = end_x - start_x
         dy = end_y - start_y
         
-        return dx < -15 and dy > 10
+        # Scaled thresholds for slow motion
+        threshold_x = -15 / SLOW_MOTION_FACTOR  # Left movement threshold
+        threshold_y = 10 / SLOW_MOTION_FACTOR   # Downward movement threshold
+        
+        return dx < threshold_x and dy > threshold_y
 
 
 class DualViewEnhancedClubTracker:
-    """Enhanced club tracker for dual-view setup"""
+    """
+    Enhanced club tracker for dual-view setup with 3D reconstruction.
+    """
     
     def __init__(self, calibration):
+        """
+        Initialize dual-view club tracker with calibration.
+        
+        Args:
+            calibration: GolfCameraCalibration instance for 3D reconstruction
+        """
         self.front_tracker = EnhancedClubTracker()
         self.side_tracker = EnhancedClubTracker()
         self.calib = calibration
@@ -437,7 +898,19 @@ class DualViewEnhancedClubTracker:
         self.max_3d_length = 100  # Maximum number of 3D positions to store
     
     def update(self, frame_idx, front_pos, front_conf, side_pos, side_conf):
-        """Update club positions in both views"""
+        """
+        Update club positions in both views and reconstruct 3D position if possible.
+        
+        Args:
+            frame_idx: Current frame index
+            front_pos: Club position in front view (x, y)
+            front_conf: Detection confidence in front view
+            side_pos: Club position in side view (x, y)
+            side_conf: Detection confidence in side view
+            
+        Returns:
+            bool: True if 3D position was successfully triangulated, False otherwise
+        """
         if front_pos is not None:
             self.front_tracker.update(front_pos[0], front_pos[1], front_conf)
         
@@ -464,43 +937,63 @@ class DualViewEnhancedClubTracker:
         
         return False
     
-    def get_recent_3d_positions(self, n_samples=5):
-        """Get n most recent 3D positions"""
-        if len(self.positions_3d) < n_samples:
-            return self.positions_3d
-        return self.positions_3d[-n_samples:]
-    
     def get_club_speed_3d(self, fps):
-        """Calculate 3D club head speed in m/s"""
+        """
+        Calculate 3D club head speed with slow motion compensation.
+        
+        Args:
+            fps: Frame rate of slow motion video
+            
+        Returns:
+            float: Club head speed in m/s (real-world value)
+        """
         if len(self.positions_3d) < 3:
             return 0.0
         
-        # Use most recent positions
-        recent = self.positions_3d[-10:]  # Use more positions to get better average
+        # Use more positions for better averaging in slow motion
+        recent = self.positions_3d[-10:]
         
         # Calculate speed between consecutive positions
         speeds = []
         for i in range(1, len(recent)):
             p1 = np.array(recent[i-1][1:4])  # 3D point (x, y, z)
             p2 = np.array(recent[i][1:4])
-            dt = (recent[i][0] - recent[i-1][0]) / fps  # Time difference in seconds
+            dt = (recent[i][0] - recent[i-1][0]) / fps  # Time in seconds
             
             if dt > 0:
                 distance = np.linalg.norm(p2 - p1)  # 3D distance
-                speed = distance / dt
+                # Scale up for slow motion compensation
+                speed = distance / dt * SLOW_MOTION_FACTOR
                 speeds.append(speed)
         
-        # Return average speed, focusing on the highest speeds (downswing)
+        # Return average of highest speeds
         if speeds:
-            # Sort speeds in descending order and take top 3
             top_speeds = sorted(speeds, reverse=True)[:3]
             avg_speed = sum(top_speeds) / len(top_speeds)
-            logging.info(f"Club speed calculated: {avg_speed:.2f}m/s")
             return avg_speed
         return 0.0
     
+    def get_recent_3d_positions(self, n_samples=5):
+        """
+        Get n most recent 3D positions.
+        
+        Args:
+            n_samples: Number of recent samples to return
+            
+        Returns:
+            list: List of recent 3D positions
+        """
+        if len(self.positions_3d) < n_samples:
+            return self.positions_3d
+        return self.positions_3d[-n_samples:]
+    
     def is_in_swing(self):
-        """Determine if player is actively swinging"""
+        """
+        Determine if player is actively swinging.
+        
+        Returns:
+            bool: True if in active swing, False otherwise
+        """
         return (self.front_tracker.is_in_backswing() or 
                 self.front_tracker.is_in_downswing() or
                 self.side_tracker.is_in_backswing() or
@@ -510,23 +1003,47 @@ class DualViewEnhancedClubTracker:
 ###############################################################################
 # BALL TRACKING CLASSES
 ###############################################################################
+
 class BallTracker:
-    """Base class for tracking ball centers in a single view"""
+    """
+    Base class for tracking ball centers in a single view.
+    """
     
     def __init__(self):
+        """Initialize ball tracker with default parameters."""
         self.positions = []  # list of (frame_idx, x, y, confidence)
         self.missed_frames = 0
         self.dynamic_margin = ROI_MARGIN_INITIAL
 
     def push_position(self, frame_idx, x, y, confidence=1.0):
+        """
+        Add a new ball position.
+        
+        Args:
+            frame_idx: Frame index
+            x, y: Ball coordinates
+            confidence: Detection confidence (0-1)
+        """
         self.positions.append((frame_idx, x, y, confidence))
 
     def get_latest_position(self):
+        """
+        Get most recent ball position.
+        
+        Returns:
+            tuple: (x, y) position or None if no positions
+        """
         if self.positions:
             return self.positions[-1][1:3]  # Return (x, y)
         return None
 
     def update_missed(self, found):
+        """
+        Update missed frames counter and adjust ROI size accordingly.
+        
+        Args:
+            found: True if ball was found in current frame, False otherwise
+        """
         if found:
             self.missed_frames = 0
             self.dynamic_margin = ROI_MARGIN_INITIAL
@@ -537,9 +1054,17 @@ class BallTracker:
 
 
 class DualViewBallTracker:
-    """Integrates tracking from two camera views for 3D ball tracking"""
+    """
+    Integrates tracking from two camera views for 3D ball tracking.
+    """
     
     def __init__(self, camera_calibration):
+        """
+        Initialize dual-view ball tracker.
+        
+        Args:
+            camera_calibration: GolfCameraCalibration instance for 3D reconstruction
+        """
         self.front_tracker = BallTracker()
         self.side_tracker = BallTracker()
         self.calib = camera_calibration
@@ -547,7 +1072,19 @@ class DualViewBallTracker:
         self.missed_frames = 0
     
     def push_position(self, frame_idx, front_pos, side_pos, front_conf=1.0, side_conf=1.0):
-        """Add corresponding positions from both views and calculate 3D position"""
+        """
+        Add corresponding positions from both views and calculate 3D position.
+        
+        Args:
+            frame_idx: Current frame index
+            front_pos: Ball position in front view (x, y)
+            front_conf: Detection confidence in front view
+            side_pos: Ball position in side view (x, y)
+            side_conf: Detection confidence in side view
+            
+        Returns:
+            bool: True if 3D position was successfully triangulated, False otherwise
+        """
         # Add to individual trackers
         if front_pos is not None:
             self.front_tracker.push_position(frame_idx, front_pos[0], front_pos[1], front_conf)
@@ -576,17 +1113,37 @@ class DualViewBallTracker:
         return False
     
     def get_latest_3d_position(self):
-        """Get the most recent 3D position"""
+        """
+        Get the most recent 3D position.
+        
+        Returns:
+            tuple: (x, y, z) coordinates or None if no positions
+        """
         if self.positions_3d:
             return self.positions_3d[-1][1:4]  # Return (x, y, z)
         return None
     
     def get_3d_positions(self):
-        """Get all 3D positions"""
+        """
+        Get all 3D positions.
+        
+        Returns:
+            list: List of (x, y, z) tuples for all tracked positions
+        """
         return [(p[1], p[2], p[3]) for p in self.positions_3d]
     
     def predict_next_3d(self, frame_idx, window=5, order=2):
-        """Predict next 3D position using polynomial fitting"""
+        """
+        Predict next 3D position using polynomial fitting.
+        
+        Args:
+            frame_idx: Frame index to predict for
+            window: Window size for fitting
+            order: Polynomial order
+            
+        Returns:
+            tuple: Predicted 3D position (x, y, z) or last known position
+        """
         if len(self.positions_3d) < 3:
             return self.get_latest_3d_position()
         
@@ -617,6 +1174,7 @@ class DualViewBallTracker:
 ###############################################################################
 # SWING STATE DETECTION
 ###############################################################################
+
 class SwingStateDetector:
     """
     Advanced swing state detector using club and ball tracking.
@@ -624,6 +1182,7 @@ class SwingStateDetector:
     """
     
     def __init__(self):
+        """Initialize swing state detector with state definitions."""
         self.states = ["SETUP", "BACKSWING", "DOWNSWING", "IMPACT", "FOLLOW_THROUGH"]
         self.current_state = "SETUP"
         self.state_history = []  # For temporal filtering
@@ -726,335 +1285,174 @@ class SwingStateDetector:
 
 
 ###############################################################################
-# ADVANCED PREPROCESSING FUNCTION
+# TRAJECTORY CALCULATION FUNCTIONS
 ###############################################################################
-def advanced_preprocess(frame):
-    """Enhance frame for better object detection"""
-    gamma = 1.2
-    inv_gamma = 1.0 / gamma
-    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
-    frame_gamma = cv2.LUT(frame, table)
-    
-    lab = cv2.cvtColor(frame_gamma, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    L_clahe = clahe.apply(L)
-    lab_clahe = cv2.merge((L_clahe, A, B))
-    frame_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-    
-    frame_denoised = cv2.GaussianBlur(frame_clahe, (3,3), 0)
-    blur = cv2.GaussianBlur(frame_denoised, (0,0), 3)
-    frame_sharp = cv2.addWeighted(frame_denoised, 1.5, blur, -0.5, 0)
 
-    hsv = cv2.cvtColor(frame_sharp, cv2.COLOR_BGR2HSV)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-    tophat = cv2.morphologyEx(hsv, cv2.MORPH_TOPHAT, kernel)
-    hsv_combined = cv2.addWeighted(hsv, 1.0, tophat, 0.5, 0)
-    processed = cv2.cvtColor(hsv_combined, cv2.COLOR_HSV2BGR)
-    return processed
-
-
-###############################################################################
-# DETECTION FUNCTIONS
-###############################################################################
-def detect_objects(frame):
-    """Detect ball and club in a frame using YOLO"""
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    # Use standard inference with the specified device (no batch parameter)
-    results = model(frame_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
-    
-    ball_bbox = None
-    ball_conf = 0.0
-    club_bbox = None
-    club_conf = 0.0
-    
-    for det in results[0].boxes:
-        cls_id = int(det.cls[0])
-        conf = float(det.conf[0])
-        if conf < CONF_THRESHOLD:
-            continue
-            
-        x1, y1, x2, y2 = map(int, det.xyxy[0].cpu().numpy())
-        
-        if cls_id == BALL_CLASS_ID and conf > ball_conf:
-            ball_bbox = [x1, y1, x2, y2]
-            ball_conf = conf
-        elif cls_id == CLUB_CLASS_ID and conf > club_conf:
-            club_bbox = [x1, y1, x2, y2]
-            club_conf = conf
-    
-    return ball_bbox, ball_conf, club_bbox, club_conf
-
-
-def detect_object_in_roi(frame, roi_center, margin, desired_class):
-    """Detect a specific object within a region of interest"""
-    try:
-        h, w, _ = frame.shape
-        cx, cy = map(int, roi_center)
-        margin = int(margin)
-        
-        # Calculate ROI boundaries
-        x1 = max(0, cx - margin)
-        y1 = max(0, cy - margin)
-        x2 = min(w, cx + margin)
-        y2 = min(h, cy + margin)
-        
-        # Ensure ROI is valid
-        if x2 <= x1 or y2 <= y1:
-            logging.warning(f"Invalid ROI dimensions: width={x2-x1}, height={y2-y1}")
-            return None, 0.0
-        
-        roi = frame[y1:y2, x1:x2]
-        if roi.shape[0] == 0 or roi.shape[1] == 0:
-            logging.warning("Empty ROI detected")
-            return None, 0.0
-        
-        # Convert BGR to RGB for YOLO
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        
-        # Run detection on ROI (without device parameter)
-        results = model(roi_rgb, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
-        
-        # Find best match for desired class
-        best_det = None
-        best_conf = -1
-        
-        for det in results[0].boxes:
-            cls_id = int(det.cls[0])
-            conf = float(det.conf[0])
-            
-            if cls_id == desired_class and conf > best_conf:
-                best_det = det
-                best_conf = conf
-        
-        if best_det is not None:
-            bx1, by1, bx2, by2 = map(int, best_det.xyxy[0].cpu().numpy())
-            # Adjust coordinates back to original frame
-            return [bx1 + x1, by1 + y1, bx2 + x1, by2 + y1], best_conf
-            
-        return None, 0.0
-        
-    except Exception as e:
-        logging.error(f"Error in ROI detection: {str(e)}")
-        return None, 0.0
-
-
-###############################################################################
-# ANALYSIS HELPER FUNCTIONS
-###############################################################################
-def is_ball_stationary(positions, window=5):
-    """Check if the ball is stationary (on tee) or in motion"""
-    if len(positions) < window:
-        return True  # Default to stationary if not enough data
-    
-    # Check recent positions
-    recent_positions = positions[-window:]
-    
-    # Calculate maximum movement
-    max_movement = 0
-    for i in range(1, len(recent_positions)):
-        p1 = recent_positions[i-1]
-        p2 = recent_positions[i]
-        movement = np.linalg.norm(np.array(p2) - np.array(p1))
-        max_movement = max(max_movement, movement)
-    
-    # Ball is stationary if maximum movement is small
-    return max_movement < 0.05  # Threshold in meters (3D space)
-
-
-def detect_impact(ball_tracker, club_tracker, frame_idx, window_size=5):
-    """Detect club-to-ball impact using 3D position data"""
-    # Force impact detection for debugging/testing purposes
-    # REMOVE THIS LINE IN PRODUCTION
-    return True  # Force detection for debugging
-    
-    # Check if we have enough 3D data
-    if (len(club_tracker.positions_3d) < window_size or 
-        len(ball_tracker.positions_3d) < window_size):
-        return False
-    
-    # Get recent club and ball positions in 3D
-    recent_club = club_tracker.positions_3d[-window_size:]
-    recent_ball = ball_tracker.positions_3d[-window_size:]
-    
-    # Latest ball position
-    latest_ball_pos = np.array(recent_ball[-1][1:4])
-    
-    # Check club movement in 3D
-    club_movement = 0
-    for i in range(1, len(recent_club)):
-        p1 = np.array(recent_club[i-1][1:4])
-        p2 = np.array(recent_club[i][1:4])
-        movement = np.linalg.norm(p2 - p1)
-        club_movement += movement
-    
-    # Check minimum distance between club and ball
-    min_distance = float('inf')
-    for club_pos in recent_club:
-        club_p = np.array(club_pos[1:4])
-        dist = np.linalg.norm(club_p - latest_ball_pos)
-        min_distance = min(min_distance, dist)
-    
-    # Detect ball movement
-    first_ball_pos = np.array(recent_ball[0][1:4])
-    last_ball_pos = np.array(recent_ball[-1][1:4])
-    ball_movement = np.linalg.norm(last_ball_pos - first_ball_pos)
-    
-    # Thresholds for impact detection (in meters)
-    club_moving = club_movement > 0.5
-    club_near_ball = min_distance < 0.1
-    ball_moving = ball_movement > 0.05
-    
-    # Check swing state from club movement
-    is_downswing = False
-    if len(club_tracker.front_tracker.filtered_path) >= 5:
-        # For right-handed golfer, downswing often moves left and down
-        recent = club_tracker.front_tracker.filtered_path[-5:]
-        start_x, start_y = recent[0]
-        end_x, end_y = recent[-1]
-        dx = end_x - start_x
-        dy = end_y - start_y
-        is_downswing = dx < -15 and dy > 10
-    
-    # More aggressive impact detection: either the ball is moving or
-    # the club is in downswing and near the ball
-    impact_detected = ball_moving or (is_downswing and club_near_ball)
-    
-    if impact_detected:
-        logging.info(f"3D Impact detected at frame {frame_idx}!")
-        logging.info(f"Club movement: {club_movement:.2f}m, Min distance: {min_distance:.2f}m, Ball movement: {ball_movement:.2f}m")
-    
-    return impact_detected
-
-
-def calculate_accurate_horizontal_angle(positions_3d, n_samples=5):
+def calculate_trajectory_polynomial(ball_positions, frame_rate):
     """
-    Calculate horizontal angle with improved accuracy.
+    Calculate trajectory using polynomial approximation method.
+    Split trajectory into segments and use least-squares fitting.
     
     Args:
-        positions_3d: List of 3D positions [(x, y, z), ...]
-        n_samples: Number of samples to use (default: 5)
+        ball_positions: List of 3D ball positions [(x, y, z), ...]
+        frame_rate: Frame rate of video
         
     Returns:
-        tuple: (angle, confidence)
+        tuple: (smooth_trajectory, carry_distance, smooth_times)
     """
-    logging.info(f"Calculating horizontal angle from {len(positions_3d)} ball positions")
-    
-    if len(positions_3d) < n_samples:
-        return 0.0, 0.0  # Angle, confidence
+    if len(ball_positions) < 5:
+        return None, 0, None
     
     try:
-        # Get initial and recent positions
-        initial_pos = np.array(positions_3d[0])
-        recent_pos = np.array(positions_3d[-1])
+        # Convert positions to numpy arrays for computation
+        positions = np.array(ball_positions)
         
-        # Calculate displacement vector in horizontal plane (X-Y)
-        dx = recent_pos[0] - initial_pos[0]
-        dy = recent_pos[1] - initial_pos[1]
+        # Create time array (assuming constant frame rate)
+        times = np.arange(len(positions)) / (frame_rate * SLOW_MOTION_FACTOR)
         
-        # Calculate horizontal distance
-        horizontal_distance = np.sqrt(dx**2 + dy**2)
+        # Split trajectory into pre-impact and post-impact segments
+        # Find point of maximum angle change in trajectory
+        max_angle_diff = 0
+        split_idx = 0
         
-        # If movement is too small, return low confidence
-        if horizontal_distance < 0.1:  # 10cm threshold
-            return 0.0, 0.2
+        for i in range(2, len(positions) - 1):
+            v1 = positions[i] - positions[i-1]
+            v2 = positions[i+1] - positions[i]
+            
+            # Calculate angle between consecutive velocity vectors
+            dot_product = np.dot(v1, v2)
+            magnitudes = np.linalg.norm(v1) * np.linalg.norm(v2)
+            
+            if magnitudes > 0:
+                angle = np.arccos(min(1.0, max(-1.0, dot_product / magnitudes)))
+                if angle > max_angle_diff:
+                    max_angle_diff = angle
+                    split_idx = i
         
-        # Calculate angle in degrees
-        angle = np.degrees(np.arctan2(dy, dx))
+        # Fit polynomials to each segment (use higher degree for better accuracy)
+        if split_idx > 2 and split_idx < len(positions) - 2:
+            # Pre-impact segment
+            pre_impact = positions[:split_idx+1]
+            pre_times = times[:split_idx+1]
+            
+            # Post-impact segment
+            post_impact = positions[split_idx:]
+            post_times = times[split_idx:]
+            
+            # Fit 3D polynomials (one for each coordinate)
+            pre_x = np.polyfit(pre_times, pre_impact[:, 0], 2)
+            pre_y = np.polyfit(pre_times, pre_impact[:, 1], 2)
+            pre_z = np.polyfit(pre_times, pre_impact[:, 2], 2)
+            
+            post_x = np.polyfit(post_times, post_impact[:, 0], 2)
+            post_y = np.polyfit(post_times, post_impact[:, 1], 2)
+            post_z = np.polyfit(post_times, post_impact[:, 2], 2)
+            
+            # Generate smooth trajectory
+            smooth_times = np.linspace(times[0], times[-1] + 2.0, 100)  # Extend prediction
+            smooth_trajectory = []
+            
+            for t in smooth_times:
+                if t <= times[split_idx]:
+                    # Pre-impact
+                    x = np.polyval(pre_x, t)
+                    y = np.polyval(pre_y, t)
+                    z = np.polyval(pre_z, t)
+                else:
+                    # Post-impact
+                    x = np.polyval(post_x, t)
+                    y = np.polyval(post_y, t)
+                    z = np.polyval(post_z, t)
+                
+                smooth_trajectory.append([x, y, z])
+            
+            # Calculate carry distance (flight distance to ground impact)
+            # Find where z becomes <= 0
+            for i in range(1, len(smooth_trajectory)):
+                if smooth_trajectory[i][2] <= 0:
+                    impact_point = smooth_trajectory[i-1]
+                    # Calculate ground distance from origin
+                    carry = np.sqrt(impact_point[0]**2 + impact_point[1]**2)
+                    return smooth_trajectory, carry, smooth_times
+            
+            # If no ground impact found, use final point
+            final_point = smooth_trajectory[-1]
+            carry = np.sqrt(final_point[0]**2 + final_point[1]**2)
+            return smooth_trajectory, carry, smooth_times
         
-        # Normalize angle to -180 to 180 range (more intuitive for golf)
-        if angle > 180:
-            angle -= 360
+        # If splitting fails, fit a single polynomial to the whole trajectory
+        x_poly = np.polyfit(times, positions[:, 0], 3)
+        y_poly = np.polyfit(times, positions[:, 1], 3)
+        z_poly = np.polyfit(times, positions[:, 2], 3)
         
-        # If moving primarily in X direction, higher confidence
-        confidence = min(1.0, horizontal_distance / 0.5)  # Confidence based on distance
-        confidence *= abs(dx) / (abs(dx) + abs(dy) + 1e-6)  # Higher confidence if X-dominant
+        # Generate smooth trajectory
+        smooth_times = np.linspace(times[0], times[-1] + 2.0, 100)  # Extend forecast
+        smooth_trajectory = []
         
-        logging.info(f"Calculated horizontal angle: {angle:.2f}° with confidence {confidence:.2f}")
+        for t in smooth_times:
+            x = np.polyval(x_poly, t)
+            y = np.polyval(y_poly, t)
+            z = np.polyval(z_poly, t)
+            smooth_trajectory.append([x, y, z])
+            
+            # Stop if predicted point hits ground
+            if z <= 0 and t > times[-1]:
+                # Calculate carry distance
+                carry = np.sqrt(x**2 + y**2)
+                return smooth_trajectory[:len(smooth_trajectory)-1], carry, smooth_times[:len(smooth_trajectory)-1]
         
-        return angle, confidence
+        # If no ground impact predicted, use final recorded position for carry estimate
+        final_point = positions[-1]
+        carry = np.sqrt(final_point[0]**2 + final_point[1]**2) * 1.5  # Scale by 1.5 for realistic carry
+        return smooth_trajectory, carry, smooth_times
         
     except Exception as e:
-        logging.error(f"Error calculating horizontal angle: {e}")
-        return 0.0, 0.0
+        logging.error(f"Error in polynomial trajectory calculation: {e}")
+        return None, 0, None
 
 
-def calculate_3d_launch_parameters(ball_positions_3d, window=5):
+def calculate_launch_parameters_from_trajectory(ball_positions, fps):
     """
-    Calculate launch parameters from 3D ball positions
+    Calculate launch parameters from 3D trajectory data.
     
+    Args:
+        ball_positions: List of 3D ball positions [(x, y, z), ...]
+        fps: Frame rate of the slow motion video
+        
     Returns:
-        tuple: (speed, vertical_angle, horizontal_angle, spin_axis)
+        tuple: (speed, vertical_angle, horizontal_angle)
     """
-    logging.info(f"Calculating launch parameters from {len(ball_positions_3d)} ball positions")
-    
-    if len(ball_positions_3d) < window + 1:
-        logging.warning("Not enough 3D positions for launch parameter calculation")
-        # Return golf-realistic defaults rather than zeros
-        return 45.0, 15.0, -5.0, [0, 1, 0]
+    if len(ball_positions) < 5:
+        return 0.0, 0.0, 0.0
     
     try:
-        # Use positions right after impact
-        positions = ball_positions_3d[:window+1]
+        # Get first positions after impact
+        positions = np.array(ball_positions[:5])
         
-        # Calculate time step (assuming constant frame rate)
-        dt = 1.0 / TARGET_FPS * window
+        # Calculate velocities between consecutive positions
+        velocities = []
+        for i in range(1, len(positions)):
+            # Scale by SLOW_MOTION_FACTOR to get real-world velocity
+            v = (positions[i] - positions[i-1]) * fps * SLOW_MOTION_FACTOR
+            velocities.append(v)
         
-        # Initial position
-        p0 = np.array(positions[0])
-        
-        # Position after window frames
-        p1 = np.array(positions[window])
-        
-        # Calculate 3D velocity vector
-        velocity = (p1 - p0) / dt
-        
-        # Print the raw velocity for debugging
-        logging.info(f"Raw velocity vector: {velocity}")
+        # Average velocity vector
+        avg_velocity = np.mean(velocities, axis=0)
         
         # Calculate speed (magnitude of velocity)
-        speed = np.linalg.norm(velocity)
-        logging.info(f"Raw calculated speed: {speed:.2f} m/s")
+        speed = np.linalg.norm(avg_velocity)
         
-        # If calculated speed is unrealistic, use golf-realistic values
-        if speed < 30 or speed > 100:
-            logging.info("Speed outside realistic range, using golf-typical value")
-            speed = 45.0  # Typical driver speed in m/s (~100mph)
+        # Calculate vertical launch angle (angle with XY plane)
+        vertical_angle = np.degrees(np.arctan2(avg_velocity[2], np.sqrt(avg_velocity[0]**2 + avg_velocity[1]**2)))
         
-        # Calculate vertical launch angle
-        vertical_angle = math.degrees(math.atan2(velocity[2], math.sqrt(velocity[0]**2 + velocity[1]**2)))
-        logging.info(f"Raw vertical angle: {vertical_angle:.2f}°")
+        # Calculate horizontal launch angle (angle in XY plane)
+        horizontal_angle = np.degrees(np.arctan2(avg_velocity[1], avg_velocity[0]))
         
-        # Calculate horizontal launch angle (direction in XY plane)
-        horizontal_angle = math.degrees(math.atan2(velocity[1], velocity[0]))
-        # Normalize to -180 to 180 range
-        if horizontal_angle > 180:
-            horizontal_angle -= 360
-        logging.info(f"Raw horizontal angle: {horizontal_angle:.2f}°")
-        
-        # If angles are unrealistic, use golf-realistic values
-        if vertical_angle < 0 or vertical_angle > 60:
-            logging.info("Vertical angle outside realistic range, using golf-typical value")
-            vertical_angle = 15.0  # Typical driver launch angle
-            
-        # Ensure horizontal angle is in a reasonable range
-        if abs(horizontal_angle) > 45:
-            logging.info("Horizontal angle outside typical range, adjusting")
-            horizontal_angle = -5.0 if horizontal_angle < 0 else 5.0
-        
-        # Estimate spin axis (simplified - would require more complex analysis)
-        spin_axis = [0, 0, 1]  # Default to backspin (around Y-axis)
-        
-        logging.info(f"Final launch parameters: Speed={speed:.2f}m/s, "
-                     f"Vertical={vertical_angle:.2f}°, "
-                     f"Horizontal={horizontal_angle:.2f}°")
-        
-        return speed, vertical_angle, horizontal_angle, spin_axis
+        return speed, vertical_angle, horizontal_angle
         
     except Exception as e:
-        logging.error(f"Error calculating 3D launch parameters: {e}")
-        logging.info("Using default golf-realistic parameters instead")
-        return 45.0, 15.0, -5.0, [0, 1, 0]  # Default golf-realistic values
+        logging.error(f"Error calculating launch parameters: {e}")
+        return 45.0, 12.0, 0.0  # Default values
 
 
 def calculate_carry_from_ball_speed(ball_speed_ms):
@@ -1104,11 +1502,130 @@ def estimate_carry_using_smash_factor(club_speed, smash_factor=SMASH_FACTOR):
     return ball_speed, carry
 
 
+def step_based_ballistics_with_spin_and_wind(v0, angle_deg, spin_rpm, wind_speed_m_s, wind_dir_deg, launch_height=0.0):
+    """
+    Physics-based ball trajectory simulation with spin and wind effects.
+    
+    Args:
+        v0: Initial velocity (m/s)
+        angle_deg: Launch angle in degrees
+        spin_rpm: Ball spin rate in RPM
+        wind_speed_m_s: Wind speed in m/s
+        wind_dir_deg: Wind direction in degrees (0 = tailwind)
+        launch_height: Initial height above ground (m)
+        
+    Returns:
+        tuple: (trajectory_points, carry_distance)
+    """
+    # Handle negative angles if needed
+    CLAMP_ANGLE = False  # Define this based on your requirements
+    if CLAMP_ANGLE and angle_deg < 0:
+        angle_deg = abs(angle_deg)
+    
+    # Ball properties
+    radius = 0.02135  # m
+    Cd = 0.2
+    mass = 0.045
+    area = math.pi * (radius**2)
+    air_density = 1.225
+    lift_mag_base = 0.285 * (1 - math.exp(-0.00026 * spin_rpm))
+    
+    # Convert degrees to radians
+    def deg_to_rad(d):
+        return d * math.pi / 180.0
+    
+    # Wind components
+    wind_dir_rad = deg_to_rad(wind_dir_deg)
+    wind_vx = wind_speed_m_s * math.cos(wind_dir_rad)
+    wind_vy = wind_speed_m_s * math.sin(wind_dir_rad)
+    
+    # Initial velocity components
+    vx = v0 * math.cos(deg_to_rad(angle_deg))
+    vy = v0 * math.sin(deg_to_rad(angle_deg))
+    
+    # Initial position
+    sx = 0.0
+    sy = launch_height
+    
+    # Time step for simulation
+    dt = 0.01
+    
+    # Store trajectory
+    traj = [(sx, sy)]
+    
+    # Run simulation until ball hits ground
+    while sy >= 0:
+        # Relative velocity (ball - wind)
+        rvx = vx - wind_vx
+        rvy = vy - wind_vy
+        vrel = math.sqrt(rvx**2 + rvy**2)
+        
+        # Drag force
+        F_drag = 0.5 * air_density * Cd * area * (vrel**2)
+        
+        if vrel > 0:
+            drag_ax = -(F_drag / mass) * (rvx / vrel)
+            drag_ay = -(F_drag / mass) * (rvy / vrel)
+        else:
+            drag_ax = 0
+            drag_ay = 0
+        
+        # Magnus effect (lift from spin)
+        if vrel > 0:
+            lift_mag = lift_mag_base * vrel
+            
+            # Vector perpendicular to relative velocity
+            perp_x = -rvy
+            perp_y = rvx
+            perp_len = math.sqrt(perp_x**2 + perp_y**2)
+            
+            if perp_len > 0:
+                perp_x /= perp_len
+                perp_y /= perp_len
+                
+            lift_ax = (lift_mag / mass) * perp_x
+            lift_ay = (lift_mag / mass) * perp_y
+        else:
+            lift_ax = 0
+            lift_ay = 0
+        
+        # Total acceleration
+        ax = drag_ax + lift_ax
+        ay = drag_ay + lift_ay - GRAVITY  # Gravity acts downwards
+        
+        # Update velocity
+        vx += ax * dt
+        vy += ay * dt
+        
+        # Update position
+        sx += vx * dt
+        sy += vy * dt
+        
+        # Add current position to trajectory
+        traj.append((sx, sy))
+        
+        # Safety to prevent infinite loops
+        if len(traj) > 200000:
+            break
+    
+    # Calculate final landing position by interpolation
+    if len(traj) >= 2 and traj[-2][1] > 0 and traj[-1][1] < 0:
+        (x_prev, y_prev) = traj[-2]
+        (x_last, y_last) = traj[-1]
+        alpha = -y_prev / (y_last - y_prev)
+        final_x = x_prev + alpha * (x_last - x_prev)
+    else:
+        final_x = traj[-1][0]
+    
+    return traj, final_x
+
+
 ###############################################################################
-# TRAJECTORY VISUALIZATION FUNCTIONS
+# VISUALIZATION FUNCTIONS
 ###############################################################################
+
 def draw_enhanced_trajectory(image, traj_points, color=(255, 0, 0), thickness=3, 
-                           draw_landing=True, landing_color=(0, 255, 255)):
+                            draw_landing=True, landing_color=(0, 255, 255)):
     """
     Draw trajectory with enhanced visibility and landing point.
     
@@ -1150,18 +1667,18 @@ def draw_enhanced_trajectory(image, traj_points, color=(255, 0, 0), thickness=3,
             # Draw landing marker (circle with cross)
             cv2.circle(image, landing_point, 7, landing_color, 2)
             cv2.line(image, 
-                    (landing_point[0] - 5, landing_point[1]),
-                    (landing_point[0] + 5, landing_point[1]),
-                    landing_color, 2)
+                     (landing_point[0] - 5, landing_point[1]),
+                     (landing_point[0] + 5, landing_point[1]),
+                     landing_color, 2)
             cv2.line(image, 
-                    (landing_point[0], landing_point[1] - 5),
-                    (landing_point[0], landing_point[1] + 5),
-                    landing_color, 2)
+                     (landing_point[0], landing_point[1] - 5),
+                     (landing_point[0], landing_point[1] + 5),
+                     landing_color, 2)
 
 
 def add_carry_distance_marker(image, landing_point, distance, 
-                             font=cv2.FONT_HERSHEY_SIMPLEX, 
-                             color=(255, 255, 0)):
+                              font=cv2.FONT_HERSHEY_SIMPLEX, 
+                              color=(255, 255, 0)):
     """
     Add distance marker at landing point.
     
@@ -1206,1017 +1723,14 @@ def add_carry_distance_marker(image, landing_point, distance,
     cv2.putText(image, text, (text_x, text_y), font, 0.6, color, 2)
 
 
-###############################################################################
-# ADVANCED GOLF BALL PHYSICS MODEL
-###############################################################################
-class GolfBallFlightModel:
+def plot_3d_trajectory(trajectory, title="Golf Ball 3D Trajectory"):
     """
-    Advanced physics model for golf ball trajectory prediction that accounts for:
-    - Drag with Reynolds number dependency
-    - Lift forces (Magnus effect)
-    - Wind effects (horizontal and vertical)
-    - Spin decay over time
-    - Air density variations with altitude
-    """
-    
-    def __init__(self):
-        # Physical constants
-        self.g = 9.81            # Gravitational acceleration (m/s²)
-        self.rho_0 = 1.225       # Air density at sea level (kg/m³)
-        self.air_viscosity = 1.81e-5  # Air viscosity (kg/m·s)
-        self.ball_mass = 0.0459  # Golf ball mass (kg)
-        self.ball_radius = 0.0213  # Golf ball radius (m)
-        self.ball_area = np.pi * self.ball_radius**2  # Cross-sectional area (m²)
-        
-        # Drag model parameters
-        self.cd_sphere = 0.47    # Base drag coefficient for a sphere
-        self.cd_dimpled_low = 0.21   # Drag coefficient for dimpled ball at low Reynolds
-        self.cd_dimpled_high = 0.25  # Drag coefficient for dimpled ball at high Reynolds
-        self.re_critical = 7.5e4  # Critical Reynolds number for transition
-        
-        # Lift model parameters
-        self.cl_max = 0.32       # Maximum lift coefficient
-        self.spin_decay_factor = 5e-5  # Spin decay factor (s⁻¹)
-        
-        # Environmental parameters
-        self.altitude = 0.0      # Altitude above sea level (m)
-        self.temperature = 20.0  # Temperature (°C)
-        self.pressure = 101325   # Air pressure (Pa)
-        self.wind_speed = 0.0    # Wind speed (m/s)
-        self.wind_direction = 0.0  # Wind direction (degrees, 0 = tailwind)
-        self.side_wind_speed = 0.0  # Side wind component (m/s)
-        
-        # Calculate air density
-        self.rho = self.rho_0
-    
-    def set_environmental_conditions(self, altitude=0.0, temperature=20.0, 
-                                     wind_speed=0.0, wind_direction=0.0, 
-                                     side_wind=0.0):
-        """Set environmental conditions for the simulation"""
-        self.altitude = altitude
-        self.temperature = temperature
-        
-        # Calculate air density based on altitude and temperature
-        self.pressure = 101325 * np.exp(-altitude / 8400)
-        temp_kelvin = temperature + 273.15
-        self.rho = self.pressure / (287.05 * temp_kelvin)
-        
-        # Set wind parameters
-        self.wind_speed = wind_speed
-        self.wind_direction = wind_direction
-        self.side_wind_speed = side_wind
-        
-        # Calculate wind components
-        wind_rad = np.radians(wind_direction)
-        self.wind_x = wind_speed * np.cos(wind_rad)
-        self.wind_y = side_wind
-        self.wind_z = wind_speed * np.sin(wind_rad)
-    
-    def get_drag_coefficient(self, velocity):
-        """Calculate drag coefficient based on Reynolds number"""
-        # Calculate Reynolds number
-        speed = np.linalg.norm(velocity)
-        reynolds = (2 * self.ball_radius * speed * self.rho) / self.air_viscosity
-        
-        # Transition between different flow regimes
-        if reynolds < self.re_critical:
-            cd = self.cd_dimpled_low
-        else:
-            # Smooth transition between low and high Reynolds regimes
-            transition_width = 0.5e4
-            t = min(1.0, max(0.0, (reynolds - self.re_critical) / transition_width))
-            cd = self.cd_dimpled_low * (1 - t) + self.cd_dimpled_high * t
-        
-        return cd
-    
-    def get_lift_coefficient(self, velocity, spin_vector):
-        """
-        Calculate lift coefficient based on spin rate and velocity.
-        
-        Args:
-            velocity: 3D velocity vector [vx, vy, vz]
-            spin_vector: 3D spin vector [wx, wy, wz] in rad/s
-        """
-        speed = np.linalg.norm(velocity)
-        if speed < 1e-6:
-            return 0.0
-        
-        # Calculate spin rate (magnitude of spin vector)
-        spin_rate = np.linalg.norm(spin_vector)
-        
-        # Normalize spin for calculation
-        normalized_spin = min(1.0, (spin_rate * self.ball_radius) / speed)
-        cl = self.cl_max * normalized_spin
-        
-        return cl
-    
-    def calculate_forces(self, t, state):
-        """
-        Calculate all forces acting on the golf ball.
-        
-        Args:
-            t: Current time
-            state: [x, y, z, vx, vy, vz, wx, wy, wz]
-                - Position (x, y, z)
-                - Velocity (vx, vy, vz)
-                - Spin (wx, wy, wz)
-        
-        Returns:
-            Forces and derivatives [dx, dy, dz, dvx, dvy, dvz, dwx, dwy, dwz]
-        """
-        x, y, z, vx, vy, vz, wx, wy, wz = state
-        
-        # Position vector
-        position = np.array([x, y, z])
-        
-        # Velocity vector
-        velocity = np.array([vx, vy, vz])
-        
-        # Spin vector
-        spin = np.array([wx, wy, wz])
-        
-        # Relative velocity (accounting for wind)
-        v_rel = velocity - np.array([self.wind_x, self.wind_y, self.wind_z])
-        speed = np.linalg.norm(v_rel)
-        
-        if speed < 1e-6:
-            return np.array([vx, vy, vz, 0, 0, -self.g, 0, 0, 0])
-        
-        # Unit vector in direction of relative velocity
-        e_v = v_rel / speed
-        
-        # Drag coefficient and force
-        cd = self.get_drag_coefficient(v_rel)
-        drag_magnitude = 0.5 * self.rho * self.ball_area * cd * speed**2
-        drag_force = -drag_magnitude * e_v
-        
-        # Lift coefficient
-        cl = self.get_lift_coefficient(v_rel, spin)
-        lift_magnitude = 0.5 * self.rho * self.ball_area * cl * speed**2
-        
-        # Calculate Magnus effect (lift) force
-        # The lift force is perpendicular to both velocity and spin axis
-        if np.linalg.norm(spin) > 1e-6:
-            spin_unit = spin / np.linalg.norm(spin)
-            lift_direction = np.cross(e_v, spin_unit)
-            
-            if np.linalg.norm(lift_direction) > 1e-6:
-                lift_direction = lift_direction / np.linalg.norm(lift_direction)
-                lift_force = lift_magnitude * lift_direction
-            else:
-                lift_force = np.zeros(3)
-        else:
-            lift_force = np.zeros(3)
-        
-        # Gravity force (acting in -z direction)
-        gravity_force = np.array([0, 0, -self.ball_mass * self.g])
-        
-        # Sum all forces
-        total_force = drag_force + lift_force + gravity_force
-        
-        # Acceleration
-        acceleration = total_force / self.ball_mass
-        
-        # Spin decay model
-        spin_decay = -self.spin_decay_factor * spin * speed
-        
-        # Combine derivatives
-        derivatives = np.zeros(9)
-        derivatives[0:3] = velocity  # dx/dt, dy/dt, dz/dt
-        derivatives[3:6] = acceleration  # dvx/dt, dvy/dt, dvz/dt
-        derivatives[6:9] = spin_decay  # dwx/dt, dwy/dt, dwz/dt
-        
-        return derivatives
-    
-    def predict_3d_trajectory(self, initial_velocity, spin_vector, 
-                             initial_position=None, simulation_time=15.0):
-        """
-        Predict 3D ball trajectory using numerical integration.
-        
-        Args:
-            initial_velocity: [vx, vy, vz] in m/s
-            spin_vector: [wx, wy, wz] in rad/s
-            initial_position: Optional [x, y, z] in m
-            simulation_time: Maximum simulation time in seconds
-            
-        Returns:
-            tuple: (trajectory_points, carry_distance)
-                - trajectory_points: List of [x, y, z] positions
-                - carry_distance: Total carry distance in meters
-        """
-        # Set initial position
-        if initial_position is None:
-            initial_position = np.zeros(3)
-        
-        # Initial conditions
-        initial_state = np.concatenate([
-            initial_position,  # x, y, z
-            initial_velocity,  # vx, vy, vz
-            spin_vector        # wx, wy, wz
-        ])
-        
-        # Define event for hitting ground (z=0)
-        def hit_ground(t, y):
-            return y[2]  # z-coordinate
-        hit_ground.terminal = True
-        hit_ground.direction = -1
-        
-        # Solve differential equation
-        sol = solve_ivp(
-            self.calculate_forces,
-            [0, simulation_time],
-            initial_state,
-            method='RK45',
-            events=hit_ground,
-            rtol=1e-4,  # Reduced tolerance for faster computation
-            atol=1e-7
-        )
-        
-        # Extract trajectory
-        trajectory = []
-        times = []
-        for i in range(len(sol.t)):
-            x, y, z = sol.y[0, i], sol.y[1, i], sol.y[2, i]
-            trajectory.append([x, y, z])
-            times.append(sol.t[i])
-        
-        # Calculate carry distance
-        if sol.t_events[0].size > 0:
-            # Ball hit the ground
-            flight_time = sol.t_events[0][0]
-            
-            # Interpolate to find exact landing position
-            i_before = np.searchsorted(sol.t, flight_time) - 1
-            
-            if i_before >= 0 and i_before < len(sol.t) - 1:
-                t0, t1 = sol.t[i_before], sol.t[i_before + 1]
-                x0, x1 = sol.y[0, i_before], sol.y[0, i_before + 1]
-                y0, y1 = sol.y[1, i_before], sol.y[1, i_before + 1]
-                z0, z1 = sol.y[2, i_before], sol.y[2, i_before + 1]
-                
-                # Linear interpolation
-                alpha = (flight_time - t0) / (t1 - t0) if t1 > t0 else 0
-                landing_x = x0 + alpha * (x1 - x0)
-                landing_y = y0 + alpha * (y1 - y0)
-                
-                # Calculate carry distance (ground distance)
-                carry_distance = math.sqrt(landing_x**2 + landing_y**2)
-            else:
-                # Fallback
-                carry_distance = math.sqrt(sol.y[0, -1]**2 + sol.y[1, -1]**2)
-        else:
-            # Ball did not hit the ground within simulation time
-            carry_distance = math.sqrt(sol.y[0, -1]**2 + sol.y[1, -1]**2)
-        
-        return trajectory, carry_distance, times
-
-
-def predict_trajectory_from_3d_parameters(speed, vertical_angle, horizontal_angle, 
-                                         backspin=3000, sidespin=0, 
-                                         wind_speed=0, wind_dir=0):
-    """
-    Calculate 3D trajectory using physics model from launch parameters.
+    Create a 3D plot of the ball trajectory.
     
     Args:
-        speed: Ball speed (m/s)
-        vertical_angle: Vertical launch angle (degrees)
-        horizontal_angle: Horizontal launch angle (degrees)
-        backspin: Backspin rate (rpm)
-        sidespin: Sidespin rate (rpm)
-        wind_speed: Wind speed (m/s)
-        wind_dir: Wind direction (degrees)
-        
-    Returns:
-        tuple: (trajectory_points, carry_distance)
+        trajectory: List of 3D points [(x, y, z), ...]
+        title: Plot title
     """
-    try:
-        # Ensure minimum realistic speed for a golf shot
-        if speed < 30:
-            speed = max(45.0, speed)  # Set minimum realistic speed
-        
-        # Create physics model
-        model = GolfBallFlightModel()
-        
-        # Set environmental conditions
-        model.set_environmental_conditions(
-            wind_speed=wind_speed,
-            wind_direction=wind_dir
-        )
-        
-        # Convert angles to radians
-        vert_rad = math.radians(vertical_angle)
-        horiz_rad = math.radians(horizontal_angle)
-        
-        # Calculate initial velocity components
-        vz = speed * math.sin(vert_rad)
-        vxy = speed * math.cos(vert_rad)
-        vx = vxy * math.cos(horiz_rad)
-        vy = vxy * math.sin(horiz_rad)
-        
-        initial_velocity = np.array([vx, vy, vz])
-        
-        # Convert spin from rpm to rad/s
-        rpm_to_rads = 2 * math.pi / 60
-        
-        # Create spin vector
-        # For pure backspin, spin is around y-axis
-        # For pure sidespin, spin is around z-axis
-        # Real spin would be a combination
-        spin_vector = np.array([
-            0,                          # x-component (tilt)
-            backspin * rpm_to_rads,     # y-component (backspin)
-            sidespin * rpm_to_rads      # z-component (sidespin)
-        ])
-        
-        # Run simulation
-        trajectory, carry, times = model.predict_3d_trajectory(
-            initial_velocity=initial_velocity,
-            spin_vector=spin_vector
-        )
-        
-        # Ensure realistic carry distance
-        if carry < 100:
-            # Scale the trajectory to give more realistic carry
-            scale_factor = 180.0 / max(1.0, carry)
-            trajectory = [[p[0] * scale_factor, p[1] * scale_factor, p[2] * scale_factor] for p in trajectory]
-            carry = carry * scale_factor
-            logging.info(f"Scaled carry distance to {carry:.1f}m for realism")
-        
-        return trajectory, carry, times
-        
-    except Exception as e:
-        logging.error(f"Trajectory prediction error: {e}")
-        # Create a simple ballistic trajectory as fallback
-        # Simple physics model: ignore air resistance and spin
-        trajectory = []
-        max_time = 6.0  # seconds
-        dt = 0.1  # time step
-        
-        # Initial conditions
-        vz = speed * math.sin(math.radians(vertical_angle))
-        vxy = speed * math.cos(math.radians(vertical_angle))
-        vx = vxy * math.cos(math.radians(horizontal_angle))
-        vy = vxy * math.sin(math.radians(horizontal_angle))
-        
-        x, y, z = 0, 0, 0
-        
-        for t in np.arange(0, max_time, dt):
-            x = vx * t
-            y = vy * t
-            z = vz * t - 0.5 * 9.81 * t**2
-            
-            trajectory.append([x, y, z])
-            
-            # Stop if ball hits ground
-            if z < 0:
-                break
-        
-        # Estimate carry with scaling to ensure realistic distance
-        carry = math.sqrt(x**2 + y**2)
-        if carry < 100:
-            carry = 180.0  # Default to realistic carry distance
-        
-        return trajectory, carry, np.arange(0, len(trajectory) * dt, dt)
-
-
-###############################################################################
-# PROCESS FRAMES
-###############################################################################
-def process_frames(front_frame, side_frame, frame_idx, ball_tracker, club_tracker, 
-                  swing_detector, calibration, in_flight, impact_detected, fps):
-    """Process a pair of frames from front and side views"""
-    global launch_speed, launch_angle_vertical, launch_angle_horizontal, predicted_carry, club_speed
-    
-    # Preprocess both frames sequentially
-    front_pp = advanced_preprocess(front_frame)
-    side_pp = advanced_preprocess(side_frame)
-    
-    # Resize for consistency
-    front_resized = cv2.resize(front_pp, (640, 480))
-    side_resized = cv2.resize(side_pp, (640, 480))
-    
-    # Create output frames
-    front_annotated = front_resized.copy()
-    side_annotated = side_resized.copy()
-    
-    # Detect objects in both views - no batch processing for stability
-    front_ball_bbox, front_ball_conf, front_club_bbox, front_club_conf = detect_objects(front_resized)
-    side_ball_bbox, side_ball_conf, side_club_bbox, side_club_conf = detect_objects(side_resized)
-    
-    # Process club detections
-    front_club_pos = None
-    side_club_pos = None
-    
-    if front_club_bbox is not None:
-        bx1, by1, bx2, by2 = front_club_bbox
-        cx = (bx1 + bx2) // 2
-        cy = (by1 + by2) // 2
-        front_club_pos = (cx, cy)
-        cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,0,255), 2)
-        cv2.putText(front_annotated, "club", (bx1, by1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-    
-    if side_club_bbox is not None:
-        bx1, by1, bx2, by2 = side_club_bbox
-        cx = (bx1 + bx2) // 2
-        cy = (by1 + by2) // 2
-        side_club_pos = (cx, cy)
-        cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,0,255), 2)
-        cv2.putText(side_annotated, "club", (bx1, by1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-    
-    # Update club tracker with new positions
-    club_tracker.update(frame_idx, 
-                      front_club_pos, front_club_conf,
-                      side_club_pos, side_club_conf)
-    
-    # Update swing state
-    swing_state, state_confidence = swing_detector.update(club_tracker, ball_tracker, frame_idx)
-    
-    # Get filtered club paths
-    front_club_path = club_tracker.front_tracker.get_path()
-    side_club_path = club_tracker.side_tracker.get_path()
-    
-    # Draw club paths with filtered data
-    # Front view - draw complete club path
-    for i in range(1, len(front_club_path)):
-        pt1 = front_club_path[i-1]
-        pt2 = front_club_path[i]
-        # Use fading color for temporal effect - more recent is brighter
-        alpha = min(1.0, i / len(front_club_path))
-        # Gradient from blue (oldest) to bright magenta (newest)
-        color = (int(200 * alpha), 0, int(100 + 155 * alpha))
-        thickness = 1 if i < len(front_club_path) - 10 else 2  # Thicker for recent path
-        cv2.line(front_annotated, pt1, pt2, color, thickness)
-    
-    # Side view - draw complete club path
-    for i in range(1, len(side_club_path)):
-        pt1 = side_club_path[i-1]
-        pt2 = side_club_path[i]
-        alpha = min(1.0, i / len(side_club_path))
-        # Use same color scheme as front view
-        color = (int(200 * alpha), 0, int(100 + 155 * alpha))
-        thickness = 1 if i < len(side_club_path) - 10 else 2
-        cv2.line(side_annotated, pt1, pt2, color, thickness)
-    
-    # Process ball detections
-    front_ball_pos = None
-    side_ball_pos = None
-    ball_detected = False
-    
-    # Direct detections
-    if front_ball_bbox is not None:
-        bx1, by1, bx2, by2 = front_ball_bbox
-        cx = (bx1 + bx2) // 2
-        cy = (by1 + by2) // 2
-        front_ball_pos = (cx, cy)
-        cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
-        status = f"ball ({front_ball_conf:.2f})"
-        cv2.putText(front_annotated, status, (bx1, by1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        ball_detected = True
-    
-    if side_ball_bbox is not None:
-        bx1, by1, bx2, by2 = side_ball_bbox
-        cx = (bx1 + bx2) // 2
-        cy = (by1 + by2) // 2
-        side_ball_pos = (cx, cy)
-        cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
-        status = f"ball ({side_ball_conf:.2f})"
-        cv2.putText(side_annotated, status, (bx1, by1-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        ball_detected = True
-    
-    # For in-flight ball, use ROI-based detection with prediction
-    if in_flight and not ball_detected:
-        # Use 3D prediction for next ball position
-        pred_3d = ball_tracker.predict_next_3d(frame_idx)
-        
-        if pred_3d is not None:
-            # Project 3D prediction to both views
-            front_pred = calibration.project_3d_to_front(pred_3d)
-            side_pred = calibration.project_3d_to_side(pred_3d)
-            
-            # Convert to integers
-            front_pred = (int(front_pred[0]), int(front_pred[1]))
-            side_pred = (int(side_pred[0]), int(side_pred[1]))
-            
-            # ROI margins
-            front_margin = ball_tracker.front_tracker.dynamic_margin
-            side_margin = ball_tracker.side_tracker.dynamic_margin
-            
-            # Try ROI detection in front view
-            front_roi_bbox, front_roi_conf = detect_object_in_roi(
-                front_resized, front_pred, front_margin, BALL_CLASS_ID
-            )
-            
-            if front_roi_bbox is not None:
-                bx1, by1, bx2, by2 = front_roi_bbox
-                cx = (bx1 + bx2) // 2
-                cy = (by1 + by2) // 2
-                front_ball_pos = (cx, cy)
-                cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
-                cv2.putText(front_annotated, f"ball (ROI: {front_roi_conf:.2f})", (bx1, by1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-            else:
-                # Use prediction in front view
-                cv2.circle(front_annotated, front_pred, 5, (0,255,255), -1)
-                cv2.putText(front_annotated, "ball (pred)", (front_pred[0]-30, front_pred[1]-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-                front_ball_pos = front_pred
-            
-            # Try ROI detection in side view
-            side_roi_bbox, side_roi_conf = detect_object_in_roi(
-                side_resized, side_pred, side_margin, BALL_CLASS_ID
-            )
-            
-            if side_roi_bbox is not None:
-                bx1, by1, bx2, by2 = side_roi_bbox
-                cx = (bx1 + bx2) // 2
-                cy = (by1 + by2) // 2
-                side_ball_pos = (cx, cy)
-                cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
-                cv2.putText(side_annotated, f"ball (ROI: {side_roi_conf:.2f})", (bx1, by1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-            else:
-                # Use prediction in side view
-                cv2.circle(side_annotated, side_pred, 5, (0,255,255), -1)
-                cv2.putText(side_annotated, "ball (pred)", (side_pred[0]-30, side_pred[1]-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-                side_ball_pos = side_pred
-    
-    # Update ball tracker with new positions
-    if front_ball_pos is not None or side_ball_pos is not None:
-        added_3d = ball_tracker.push_position(
-            frame_idx, front_ball_pos, side_ball_pos, 
-            front_ball_conf if front_ball_pos is not None else 0.0,
-            side_ball_conf if side_ball_pos is not None else 0.0
-        )
-        
-        if added_3d:
-            ball_detected = True
-    
-    # Get 3D positions for display
-    ball_positions_3d = ball_tracker.get_3d_positions()
-    
-    # Calculate accurate horizontal angle if we have enough data
-    if len(ball_positions_3d) >= 5:
-        # Always try to calculate the horizontal angle, even if in flight
-        horizontal_angle, angle_confidence = calculate_accurate_horizontal_angle(ball_positions_3d)
-        
-        # Only update if confidence is high enough
-        if angle_confidence > 0.3:  # Lower threshold to make it more responsive
-            launch_angle_horizontal = horizontal_angle
-            logging.info(f"Updated horizontal angle to {horizontal_angle:.2f}° (confidence: {angle_confidence:.2f})")
-    
-    # Draw 3D trajectory
-    if len(ball_positions_3d) > 1:
-        # Project 3D points back to both views
-        front_traj = []
-        side_traj = []
-        
-        for pos_3d in ball_positions_3d:
-            # Project 3D point to front view
-            front_point = calibration.project_3d_to_front(pos_3d)
-            front_traj.append((int(front_point[0]), int(front_point[1])))
-            
-            # Project 3D point to side view
-            side_point = calibration.project_3d_to_side(pos_3d)
-            side_traj.append((int(side_point[0]), int(side_point[1])))
-        
-        # Draw 3D trajectory on both views
-        for i in range(1, len(front_traj)):
-            pt1 = front_traj[i-1]
-            pt2 = front_traj[i]
-            # Fade-in effect
-            alpha = min(1.0, i / len(front_traj))
-            color = (0, int(255 * alpha), 0)
-            cv2.line(front_annotated, pt1, pt2, color, 2)
-        
-        for i in range(1, len(side_traj)):
-            pt1 = side_traj[i-1]
-            pt2 = side_traj[i]
-            # Fade-in effect
-            alpha = min(1.0, i / len(side_traj))
-            color = (0, int(255 * alpha), 0)
-            cv2.line(side_annotated, pt1, pt2, color, 2)
-    
-    # Display metrics and predicted trajectory
-    if launch_speed > 0:
-        # Format horizontal angle correctly - remove question marks
-        horiz_angle_text = f"{launch_angle_horizontal:.1f}°"
-        
-        # Front view metrics
-        cv2.putText(front_annotated, f"Club Speed: {club_speed:.1f} m/s ({club_speed*2.237:.0f}mph)", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(front_annotated, f"Ball Speed: {launch_speed:.1f} m/s ({launch_speed*2.237:.0f}mph)", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(front_annotated, f"Smash Factor: {SMASH_FACTOR:.2f}", (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(front_annotated, f"Horiz. Angle: {horiz_angle_text}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(front_annotated, f"Est. Carry: {predicted_carry:.1f}m ({predicted_carry/METERS_PER_YARD:.0f}yd)", (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
-        # Side view metrics
-        cv2.putText(side_annotated, f"Club Speed: {club_speed:.1f} m/s ({club_speed*2.237:.0f}mph)", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(side_annotated, f"Ball Speed: {launch_speed:.1f} m/s ({launch_speed*2.237:.0f}mph)", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(side_annotated, f"Launch Angle: {launch_angle_vertical:.1f}°", (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(side_annotated, f"Smash Factor: {SMASH_FACTOR:.2f}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        cv2.putText(side_annotated, f"Est. Carry: {predicted_carry:.1f}m ({predicted_carry/METERS_PER_YARD:.0f}yd)", (10, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
-        # Display tracking status on both views
-        status_msg = "Tracking: " + ("Active" if ball_detected else f"Lost ({ball_tracker.missed_frames})")
-        status_color = (0, 255, 0) if ball_detected else (255, 165, 0)
-        cv2.putText(front_annotated, status_msg, (10, 130),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-        cv2.putText(side_annotated, status_msg, (10, 130),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-        
-        # Show impact status
-        if impact_detected:
-            cv2.putText(front_annotated, "Impact Detected", (10, 180),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-            cv2.putText(side_annotated, "Impact Detected", (10, 180),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-        
-        # Calculate predicted 3D trajectory with improved visualization
-        if len(ball_positions_3d) > 0:
-            try:
-                pred_traj, carry_distance, _ = predict_trajectory_from_3d_parameters(
-                    launch_speed, launch_angle_vertical, launch_angle_horizontal,
-                    BACKSPIN_RPM, SIDESPIN_RPM, WIND_SPEED, WIND_DIRECTION
-                )
-                
-                # Update predicted carry with the newly calculated value
-                if impact_detected and in_flight:
-                    # Only update after impact has been detected and ball is in flight
-                    predicted_carry = carry_distance
-                    logging.info(f"Updated predicted carry to {predicted_carry:.2f}m after impact")
-                
-                # Get initial 3D position
-                initial_pos = ball_positions_3d[0]
-                
-                # Project predicted trajectory to both views
-                front_pred_traj = []
-                side_pred_traj = []
-                
-                for point in pred_traj:
-                    # Add predicted point to initial position
-                    pos_3d = np.array(initial_pos) + np.array(point)
-                    
-                    # Project to front view
-                    front_point = calibration.project_3d_to_front(pos_3d)
-                    front_x, front_y = int(front_point[0]), int(front_point[1])
-                    if 0 <= front_x < 640 and 0 <= front_y < 480:
-                        front_pred_traj.append((front_x, front_y))
-                    
-                    # Project to side view
-                    side_point = calibration.project_3d_to_side(pos_3d)
-                    side_x, side_y = int(side_point[0]), int(side_point[1])
-                    if 0 <= side_x < 640 and 0 <= side_y < 480:
-                        side_pred_traj.append((side_x, side_y))
-                
-                # Draw enhanced trajectory on both views
-                draw_enhanced_trajectory(front_annotated, front_pred_traj, 
-                                       color=(255, 0, 0), thickness=3, 
-                                       draw_landing=True)
-                
-                draw_enhanced_trajectory(side_annotated, side_pred_traj,
-                                       color=(255, 0, 0), thickness=3,
-                                       draw_landing=True)
-                
-                # Add carry distance markers at landing points
-                if front_pred_traj and side_pred_traj:
-                    add_carry_distance_marker(front_annotated, front_pred_traj[-1], 
-                                             predicted_carry)
-                    add_carry_distance_marker(side_annotated, side_pred_traj[-1],
-                                             predicted_carry)
-                    
-            except Exception as e:
-                logging.error(f"Error drawing predicted trajectory: {e}")
-    
-    # Display swing state on both views
-    if swing_state == "SETUP":
-        setup_color = (0, 255, 255)  # Yellow
-    else:
-        setup_color = (128, 128, 0)  # Dark yellow/gold
-    
-    cv2.putText(front_annotated, swing_state, (10, 160),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, setup_color, 2)
-    cv2.putText(side_annotated, swing_state, (10, 160),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, setup_color, 2)
-    
-    # Create combined view (side by side)
-    combined = np.zeros((480, 1280, 3), dtype=np.uint8)
-    combined[:, :640] = front_annotated
-    combined[:, 640:] = side_annotated
-    
-    # Add separating line
-    cv2.line(combined, (640, 0), (640, 480), (200, 200, 200), 2)
-    
-    # Add view labels
-    cv2.putText(combined, "Front View", (20, 470),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(combined, "Side View", (660, 470),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    
-    return combined, ball_detected
-
-
-###############
-
-###############################################################################
-# MAIN FUNCTION
-###############################################################################
-def main():
-    global launch_speed, launch_angle_vertical, launch_angle_horizontal, predicted_carry, club_speed
-    
-    # Start timing for performance measurement
-    start_time = time.time()
-    
-    # Display welcome message
-    print("="*80)
-    print("FlightSight Pro Dual-Angle Golf Analysis - Kaggle Edition")
-    print("="*80)
-    
-    # Initialize with placeholder values - these will be replaced
-    # with calculated values once impact is detected
-    launch_speed = 0.0 
-    launch_angle_vertical = 0.0
-    launch_angle_horizontal = 0.0
-    predicted_carry = 0.0
-    club_speed = 0.0
-    
-    # Create debug directory
-    if DEBUG_SAVE_FRAMES:
-        os.makedirs(DEBUG_FRAME_DIR, exist_ok=True)
-    
-    logging.info("Starting FlightSight Pro Dual-Angle Golf Analysis")
-    
-    # Allow user to upload files if running in Kaggle/Colab
-    if UPLOAD_VIDEOS:
-        upload_files()
-    
-    # Load YOLO model
-    load_yolo_model()
-    
-    # Create camera calibration
-    calibration = CameraCalibration(
-        CAMERA_MATRIX_FRONT, CAMERA_MATRIX_SIDE, CAMERA_OFFSET
-    )
-    
-    # Check input videos
-    if not os.path.isfile(FRONT_VIDEO_PATH):
-        logging.error(f"Front view video not found: {FRONT_VIDEO_PATH}")
-        return
-    
-    if not os.path.isfile(SIDE_VIDEO_PATH):
-        logging.error(f"Side view video not found: {SIDE_VIDEO_PATH}")
-        return
-    
-    # Open video captures
-    front_cap = cv2.VideoCapture(FRONT_VIDEO_PATH)
-    side_cap = cv2.VideoCapture(SIDE_VIDEO_PATH)
-    
-    if not front_cap.isOpened():
-        logging.error(f"Could not open front video: {FRONT_VIDEO_PATH}")
-        return
-    
-    if not side_cap.isOpened():
-        logging.error(f"Could not open side video: {SIDE_VIDEO_PATH}")
-        front_cap.release()
-        return
-    
-    # Get video properties
-    front_fps = front_cap.get(cv2.CAP_PROP_FPS)
-    side_fps = side_cap.get(cv2.CAP_PROP_FPS)
-    
-    # Use minimum FPS for synchronization
-    fps = min(front_fps, side_fps)
-    if fps <= 0:
-        fps = TARGET_FPS
-    
-    # Setup output video
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"flightsight_pro_analysis_{timestamp}.mp4"
-    out = cv2.VideoWriter(output_path, fourcc, fps, (1280, 480))
-    
-    # Create trackers
-    ball_tracker = DualViewBallTracker(calibration)
-    club_tracker = DualViewEnhancedClubTracker(calibration)
-    swing_detector = SwingStateDetector()
-    
-    # Initialize state variables
-    in_flight = False
-    impact_detected = False
-    impact_frame = 0
-    frame_idx = 0
-    all_ball_positions_3d = []
-    
-    # Count total frames for progress reporting
-    total_frames = int(min(front_cap.get(cv2.CAP_PROP_FRAME_COUNT), 
-                         side_cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-    
-    # Process videos
-    print("Processing videos... This may take a few minutes. Progress will be reported every 30 frames.")
-    
-    # Add a progress bar if available
-    try:
-        from tqdm.notebook import tqdm
-        progress_bar = tqdm(total=total_frames)
-        use_progress_bar = True
-    except:
-        use_progress_bar = False
-    
-    while True:
-        # Clear GPU cache periodically to avoid memory fragmentation
-        if frame_idx % 100 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-        
-        # Read frames from both videos
-        front_ret, front_frame = front_cap.read()
-        side_ret, side_frame = side_cap.read()
-        
-        # Check if we've reached the end
-        if not front_ret or not side_ret:
-            logging.info(f"Reached end of videos at frame {frame_idx}")
-            break
-        
-        # Print progress
-        if frame_idx % 30 == 0:
-            percent_done = min(100, int(frame_idx / total_frames * 100))
-            print(f"Processing: {percent_done}% complete ({frame_idx}/{total_frames} frames)")
-            
-            # Display memory usage on GPU if available
-            if torch.cuda.is_available():
-                memory_allocated = torch.cuda.memory_allocated(0) / (1024**3)
-                memory_reserved = torch.cuda.memory_reserved(0) / (1024**3)
-                print(f"  GPU memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
-        
-        # Update progress bar if available
-        if use_progress_bar:
-            progress_bar.update(1)
-        
-        try:
-            # Skip frames for faster processing if needed (but don't skip at the beginning)
-            if PROCESS_INTERVAL > 1 and frame_idx % PROCESS_INTERVAL != 0 and frame_idx > 10:
-                frame_idx += 1
-                continue
-            
-            # Process frames (sequential processing - no multiprocessing)
-            combined_frame, ball_detected = process_frames(
-                front_frame, side_frame, frame_idx,
-                ball_tracker, club_tracker, swing_detector, calibration,
-                in_flight, impact_detected, fps
-            )
-            
-            # Save 3D positions for further analysis
-            latest_3d = ball_tracker.get_latest_3d_position()
-            if latest_3d is not None:
-                all_ball_positions_3d.append(latest_3d)
-            
-            # Check for impact
-            if not impact_detected:
-                # Try to detect actual impact
-                impact_detected = detect_impact(ball_tracker, club_tracker, frame_idx)
-                
-                # If not detected but we have club speed, force detection
-                if not impact_detected and frame_idx > 30:  # Give time to track the club
-                    # Calculate club head speed
-                    club_speed = club_tracker.get_club_speed_3d(fps)
-                    
-                    if club_speed > 10:  # Reasonable threshold for swing
-                        impact_detected = True
-                        impact_frame = frame_idx
-                        print(f"\nIMPACT DETECTED based on club speed: {club_speed:.2f} m/s")
-                
-                if impact_detected:
-                    impact_frame = frame_idx
-                    logging.info(f"Impact detected at frame {impact_frame}")
-                    print(f"\nIMPACT DETECTED at frame {impact_frame}!")
-            
-            # Check for launch after impact
-            if impact_detected and not in_flight:
-                # Calculate club head speed
-                club_speed = club_tracker.get_club_speed_3d(fps)
-                
-                # Use club head speed to calculate ball speed and carry via smash factor
-                if club_speed < 10:  # If club speed detection is poor
-                    club_speed = 30.0  # Use typical golf swing speed ~67mph
-                
-                ball_speed, carry_distance = estimate_carry_using_smash_factor(club_speed)
-                
-                # Update global parameters
-                launch_speed = ball_speed
-                launch_angle_vertical = 12.0  # Typical driver launch angle
-                launch_angle_horizontal = -5.0  # Slight draw bias
-                predicted_carry = carry_distance
-                
-                print(f"\nGolf Shot Parameters Calculated:")
-                print(f"  Club Speed: {club_speed:.2f}m/s ({club_speed*2.237:.1f}mph)")
-                print(f"  Ball Speed: {ball_speed:.2f}m/s ({ball_speed*2.237:.1f}mph)")
-                print(f"  Smash Factor: {SMASH_FACTOR:.2f}")
-                print(f"  Launch Angle: {launch_angle_vertical:.1f}° vertical, {launch_angle_horizontal:.1f}° horizontal")
-                print(f"  Predicted Carry: {predicted_carry:.2f}m ({predicted_carry/METERS_PER_YARD:.1f}yd)")
-                
-                in_flight = True
-            
-            # Write frame to output video
-            out.write(combined_frame)
-            
-            # Skip displaying frames during processing
-            # We'll only show final summary
-            
-            frame_idx += 1
-            
-        except Exception as e:
-            logging.error(f"Error processing frame {frame_idx}: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Try to continue with next frame
-            frame_idx += 1
-            continue
-    
-    # Close progress bar if used
-    if use_progress_bar:
-        progress_bar.close()
-    
-    # Clean up
-    front_cap.release()
-    side_cap.release()
-    out.release()
-    cv2.destroyAllWindows()
-    
-    # Report processing statistics
-    end_time = time.time()
-    total_time = end_time - start_time
-    processing_fps = frame_idx / max(1, total_time)
-    print(f"\nProcessing complete: {frame_idx} frames in {total_time:.1f} seconds ({processing_fps:.1f} fps)")
-    print(f"Output video saved to: {output_path}")
-    
-    # Save a final snapshot with all metrics
-    if frame_idx > 0:
-        snapshot_filename = f"final_analysis_{timestamp}.jpg"
-        cv2.imwrite(snapshot_filename, combined_frame)
-        print(f"Final analysis snapshot saved to {snapshot_filename}")
-        
-        # Show final result (just one frame)
-        plt.figure(figsize=(16, 10))
-        plt.imshow(cv2.cvtColor(combined_frame, cv2.COLOR_BGR2RGB))
-        plt.axis('off')
-        plt.title("Final Analysis Result")
-        plt.show()
-    
-    # Display final results as text
-    print("\n" + "="*50)
-    print("Golf Shot Analysis Results")
-    print("="*50)
-    print(f"Club Speed: {club_speed:.2f} m/s ({club_speed*2.237:.2f} mph)")
-    print(f"Ball Speed: {launch_speed:.2f} m/s ({launch_speed*2.237:.2f} mph)")
-    print(f"Smash Factor: {SMASH_FACTOR:.2f}")
-    print(f"Vertical Launch Angle: {launch_angle_vertical:.2f}°")
-    print(f"Horizontal Launch Angle: {launch_angle_horizontal:.2f}°")
-    print(f"Estimated Carry Distance: {predicted_carry:.2f} m ({predicted_carry/METERS_PER_YARD:.2f} yards)")
-    print("="*50)
-    
-    # Provide download links in notebook environment
-    try:
-        from google.colab import files
-        print("\nDownload files:")
-        files.download(output_path)
-        if os.path.exists(snapshot_filename):
-            files.download(snapshot_filename)
-    except:
-        print(f"\nOutput files available at: {output_path} and {snapshot_filename}")
-    
-    return {
-        'club_speed_ms': club_speed,
-        'club_speed_mph': club_speed * 2.237,
-        'ball_speed_ms': launch_speed,
-        'ball_speed_mph': launch_speed * 2.237,
-        'smash_factor': SMASH_FACTOR,
-        'vertical_angle': launch_angle_vertical,
-        'horizontal_angle': launch_angle_horizontal,
-        'carry_distance_m': predicted_carry,
-        'carry_distance_yards': predicted_carry/METERS_PER_YARD
-    }
-
-
-###############################################################################
-# PLOTTING FUNCTIONS FOR TRAJECTORY VISUALIZATION
-###############################################################################
-def plot_3d_trajectory(trajectory, title="Golf Ball 3D Trajectory"):
-    """Create a 3D plot of the ball trajectory"""
-    import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D
     
     fig = plt.figure(figsize=(10, 8))
@@ -2257,9 +1771,17 @@ def plot_3d_trajectory(trajectory, title="Golf Ball 3D Trajectory"):
 
 
 def plot_launch_parameters(club_speed, ball_speed, smash_factor, vert_angle, horiz_angle, carry_distance):
-    """Create a visualization of the launch parameters with club speed and smash factor"""
-    import matplotlib.pyplot as plt
+    """
+    Create a visualization of the launch parameters with club speed and smash factor.
     
+    Args:
+        club_speed: Club head speed in m/s
+        ball_speed: Ball speed in m/s
+        smash_factor: Ratio of ball speed to club speed
+        vert_angle: Vertical launch angle in degrees
+        horiz_angle: Horizontal launch angle in degrees
+        carry_distance: Carry distance in meters
+    """
     # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
     
@@ -2315,36 +1837,946 @@ def plot_launch_parameters(club_speed, ball_speed, smash_factor, vert_angle, hor
 
 
 ###############################################################################
-# ENTRY POINT FOR KAGGLE NOTEBOOK
+# MAIN FRAME PROCESSING FUNCTION
 ###############################################################################
-if __name__ == "__main__":
-    # Execute main function
-    results = main()
+
+def process_frames(front_frame, side_frame, frame_idx, ball_tracker, club_tracker, 
+                  swing_detector, calibration, in_flight, impact_detected, fps,
+                  front_bg=None, prev_front=None, prev_side=None):
+    """
+    Process a pair of frames from front and side views.
     
-    # If impact was detected and trajectory calculated, show plots
-    if results['ball_speed_ms'] > 0:
-        # Calculate predicted trajectory
-        pred_traj, carry, _ = predict_trajectory_from_3d_parameters(
-            results['ball_speed_ms'], 
-            results['vertical_angle'], 
-            results['horizontal_angle'],
-            BACKSPIN_RPM, SIDESPIN_RPM,
-            WIND_SPEED, WIND_DIRECTION
-        )
+    Args:
+        front_frame: Frame from front (behind golfer) camera
+        side_frame: Frame from side camera
+        frame_idx: Current frame index
+        ball_tracker: DualViewBallTracker instance
+        club_tracker: DualViewEnhancedClubTracker instance
+        swing_detector: SwingStateDetector instance
+        calibration: GolfCameraCalibration instance
+        in_flight: Whether ball is in flight
+        impact_detected: Whether impact has been detected
+        fps: Frame rate
+        front_bg: Background frame for front view
+        prev_front: Previous front frame
+        prev_side: Previous side frame
         
-        # Plot 3D trajectory
-        plot_3d_trajectory(pred_traj, title=f"Golf Ball Trajectory - Carry: {carry:.1f}m ({carry/METERS_PER_YARD:.1f} yards)")
-        
-        # Plot launch parameters
-        plot_launch_parameters(
-            results['club_speed_ms'],
-            results['ball_speed_ms'],
-            results['smash_factor'],
-            results['vertical_angle'],
-            results['horizontal_angle'],
-            results['carry_distance_m']
-        )
-        
-        print("\nAnalysis complete! Check the visualizations above for detailed results.")
+    Returns:
+        tuple: (combined_frame, ball_detected)
+    """
+    global launch_speed, launch_angle_vertical, launch_angle_horizontal, predicted_carry, club_speed
+    
+    #----------------------------------------------------------------------
+    # 1. INITIALIZATION AND FRAME SETUP
+    #----------------------------------------------------------------------
+    
+    # Create standard-sized output frames for processing
+    standard_width = 640
+    standard_height = 480
+    
+    # Initialize club and ball position variables
+    front_club_pos = None
+    side_club_pos = None
+    front_ball_pos = None
+    side_ball_pos = None
+    
+    # Initialize detection confidence values
+    front_ball_conf = 0.0
+    side_ball_conf = 0.0
+    front_club_conf = 0.0
+    side_club_conf = 0.0
+    
+    # Initialize flag for ball detection
+    ball_detected = False
+    
+    # Create copies of frames for annotation with standard size
+    if front_frame is not None:
+        # Get original frame dimensions
+        h_front, w_front = front_frame.shape[:2]
+        front_resized = cv2.resize(front_frame, (standard_width, standard_height))
+        front_annotated = front_resized.copy()
     else:
-        print("\nNo valid shot detected in the video. Try adjusting detection parameters or using a different video.")
+        front_annotated = np.zeros((standard_height, standard_width, 3), dtype=np.uint8)
+        w_front, h_front = standard_width, standard_height
+        
+    if side_frame is not None:
+        # Get original frame dimensions
+        h_side, w_side = side_frame.shape[:2]
+        side_resized = cv2.resize(side_frame, (standard_width, standard_height))
+        side_annotated = side_resized.copy()
+    else:
+        side_annotated = np.zeros((standard_height, standard_width, 3), dtype=np.uint8)
+        w_side, h_side = standard_width, standard_height
+    
+    #----------------------------------------------------------------------
+    # 2. PREPROCESS AND DETECT OBJECTS
+    #----------------------------------------------------------------------
+    
+    # Preprocess frames at standard resolution
+    front_pp = advanced_preprocess(front_resized) if front_frame is not None else None
+    side_pp = advanced_preprocess(side_resized) if side_frame is not None else None
+    
+    # Detect objects at standard resolution
+    front_ball_bbox, front_ball_conf, front_club_bbox, front_club_conf = detect_objects(front_pp)
+    side_ball_bbox, side_ball_conf, side_club_bbox, side_club_conf = detect_objects(side_pp)
+    
+    #----------------------------------------------------------------------
+    # 3. ENHANCED BALL DETECTION WITH MOTION
+    #----------------------------------------------------------------------
+    
+    # Use enhanced ball detection based on research paper approach
+    if prev_front is not None and front_bg is not None:
+        # Resize previous frames to standard resolution
+        prev_front_resized = cv2.resize(prev_front, (standard_width, standard_height))
+        front_bg_resized = cv2.resize(front_bg, (standard_width, standard_height))
+        
+        front_ball_pos_motion, front_ball_conf_motion = detect_ball_with_motion(
+            front_pp, prev_front_resized, front_bg_resized
+        )
+        
+        # If motion-based detection found a ball
+        if front_ball_pos_motion is not None:
+            # Convert to bbox format [x1, y1, x2, y2] for consistency
+            x, y = front_ball_pos_motion
+            radius = 10  # Approximate radius for golf ball
+            front_ball_motion_bbox = [x-radius, y-radius, x+radius, y+radius]
+            
+            # Use motion-based detection if confidence is higher or YOLO didn't find anything
+            if front_ball_conf_motion > front_ball_conf or front_ball_bbox is None:
+                front_ball_bbox = front_ball_motion_bbox
+                front_ball_conf = max(front_ball_conf, front_ball_conf_motion)
+    
+    if prev_side is not None and front_bg is not None:
+        # Resize previous frames to standard resolution
+        prev_side_resized = cv2.resize(prev_side, (standard_width, standard_height))
+        side_bg_resized = cv2.resize(front_bg, (standard_width, standard_height))  # Using front_bg as placeholder
+        
+        side_ball_pos_motion, side_ball_conf_motion = detect_ball_with_motion(
+            side_pp, prev_side_resized, side_bg_resized
+        )
+        
+        # If motion-based detection found a ball
+        if side_ball_pos_motion is not None:
+            # Convert to bbox format [x1, y1, x2, y2] for consistency
+            x, y = side_ball_pos_motion
+            radius = 10  # Approximate radius for golf ball
+            side_ball_motion_bbox = [x-radius, y-radius, x+radius, y+radius]
+            
+            # Use motion-based detection if confidence is higher or YOLO didn't find anything
+            if side_ball_conf_motion > side_ball_conf or side_ball_bbox is None:
+                side_ball_bbox = side_ball_motion_bbox
+                side_ball_conf = max(side_ball_conf, side_ball_conf_motion)
+    
+    #----------------------------------------------------------------------
+    # 4. CLUB DETECTION AND VISUALIZATION
+    #----------------------------------------------------------------------
+    
+    # Process club detections
+    if front_club_bbox is not None:
+        bx1, by1, bx2, by2 = front_club_bbox
+        cx = (bx1 + bx2) // 2
+        cy = (by1 + by2) // 2
+        front_club_pos = (cx, cy)
+        cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,0,255), 2)
+        cv2.putText(front_annotated, "club", (bx1, by1-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+    
+    if side_club_bbox is not None:
+        bx1, by1, bx2, by2 = side_club_bbox
+        cx = (bx1 + bx2) // 2
+        cy = (by1 + by2) // 2
+        side_club_pos = (cx, cy)
+        cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,0,255), 2)
+        cv2.putText(side_annotated, "club", (bx1, by1-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+    
+    # Update club tracker with new positions
+    club_tracker.update(frame_idx, 
+                      front_club_pos, front_club_conf,
+                      side_club_pos, side_club_conf)
+    
+    # Update swing state
+    swing_state, state_confidence = swing_detector.update(club_tracker, ball_tracker, frame_idx)
+    
+    # Get filtered club paths
+    front_club_path = club_tracker.front_tracker.get_path()
+    side_club_path = club_tracker.side_tracker.get_path()
+    
+    # Always calculate club speed for display and metrics estimation
+    if club_speed == 0 and len(club_tracker.positions_3d) >= 3:
+        new_club_speed = club_tracker.get_club_speed_3d(fps)
+        if new_club_speed > 5.0:  # Only update if reasonable value
+            club_speed = new_club_speed
+            
+            # Pre-calculate estimated values based on club speed for early display
+            ball_speed_est = club_speed * SMASH_FACTOR
+            carry_est = calculate_carry_from_ball_speed(ball_speed_est)
+            
+            # Set global values if they haven't been set yet
+            if launch_speed == 0:
+                launch_speed = ball_speed_est
+            if predicted_carry == 0:
+                predicted_carry = carry_est
+            if launch_angle_vertical == 0:
+                launch_angle_vertical = 12.0  # Typical default launch angle
+    
+    # Draw club paths with thicker lines and gradient coloring
+    # Front view - draw complete club path with increased thickness
+    for i in range(1, len(front_club_path)):
+        pt1 = front_club_path[i-1]
+        pt2 = front_club_path[i]
+        # Use fading color for temporal effect - more recent is brighter
+        alpha = min(1.0, i / len(front_club_path))
+        # Gradient from blue (oldest) to bright magenta (newest)
+        color = (int(200 * alpha), 0, int(100 + 155 * alpha))
+        # Increase thickness for all segments, with even thicker lines for recent path
+        thickness = 2 if i < len(front_club_path) - 10 else 3
+        cv2.line(front_annotated, pt1, pt2, color, thickness)
+    
+    # Side view - draw complete club path with increased thickness
+    for i in range(1, len(side_club_path)):
+        pt1 = side_club_path[i-1]
+        pt2 = side_club_path[i]
+        alpha = min(1.0, i / len(side_club_path))
+        # Use same color scheme as front view
+        color = (int(200 * alpha), 0, int(100 + 155 * alpha))
+        # Increase thickness for all segments, with even thicker lines for recent path
+        thickness = 2 if i < len(side_club_path) - 10 else 3
+        cv2.line(side_annotated, pt1, pt2, color, thickness)
+    
+    #----------------------------------------------------------------------
+    # 5. BALL DETECTION AND VISUALIZATION
+    #----------------------------------------------------------------------
+    
+    # Process ball detections
+    if front_ball_bbox is not None:
+        bx1, by1, bx2, by2 = front_ball_bbox
+        cx = (bx1 + bx2) // 2
+        cy = (by1 + by2) // 2
+        front_ball_pos = (cx, cy)
+        cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
+        status = f"ball ({front_ball_conf:.2f})"
+        cv2.putText(front_annotated, status, (bx1, by1-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        ball_detected = True
+    
+    if side_ball_bbox is not None:
+        bx1, by1, bx2, by2 = side_ball_bbox
+        cx = (bx1 + bx2) // 2
+        cy = (by1 + by2) // 2
+        side_ball_pos = (cx, cy)
+        cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
+        status = f"ball ({side_ball_conf:.2f})"
+        cv2.putText(side_annotated, status, (bx1, by1-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        ball_detected = True
+    
+    # For in-flight ball, use ROI-based detection with prediction
+    if in_flight and not ball_detected:
+        # Use 3D prediction for next ball position
+        pred_3d = ball_tracker.predict_next_3d(frame_idx)
+        
+        if pred_3d is not None:
+            # Project 3D prediction to both views
+            front_pred = calibration.project_3d_to_front(pred_3d)
+            side_pred = calibration.project_3d_to_side(pred_3d)
+            
+            # Convert to integers
+            front_pred = (int(front_pred[0]), int(front_pred[1]))
+            side_pred = (int(side_pred[0]), int(side_pred[1]))
+            
+            # ROI margins
+            front_margin = ball_tracker.front_tracker.dynamic_margin
+            side_margin = ball_tracker.side_tracker.dynamic_margin
+            
+            # Try ROI detection in front view
+            front_roi_bbox, front_roi_conf = detect_object_in_roi(
+                front_pp, front_pred, front_margin, BALL_CLASS_ID
+            )
+            
+            if front_roi_bbox is not None:
+                bx1, by1, bx2, by2 = front_roi_bbox
+                cx = (bx1 + bx2) // 2
+                cy = (by1 + by2) // 2
+                front_ball_pos = (cx, cy)
+                cv2.rectangle(front_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
+                cv2.putText(front_annotated, f"ball (ROI: {front_roi_conf:.2f})", (bx1, by1-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            else:
+                # Use prediction in front view
+                cv2.circle(front_annotated, front_pred, 5, (0,255,255), -1)
+                cv2.putText(front_annotated, "ball (pred)", (front_pred[0]-30, front_pred[1]-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+                front_ball_pos = front_pred
+            
+            # Try ROI detection in side view
+            side_roi_bbox, side_roi_conf = detect_object_in_roi(
+                side_pp, side_pred, side_margin, BALL_CLASS_ID
+            )
+            
+            if side_roi_bbox is not None:
+                bx1, by1, bx2, by2 = side_roi_bbox
+                cx = (bx1 + bx2) // 2
+                cy = (by1 + by2) // 2
+                side_ball_pos = (cx, cy)
+                cv2.rectangle(side_annotated, (bx1, by1), (bx2, by2), (0,255,0), 2)
+                cv2.putText(side_annotated, f"ball (ROI: {side_roi_conf:.2f})", (bx1, by1-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            else:
+                # Use prediction in side view
+                cv2.circle(side_annotated, side_pred, 5, (0,255,255), -1)
+                cv2.putText(side_annotated, "ball (pred)", (side_pred[0]-30, side_pred[1]-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+                side_ball_pos = side_pred
+    
+    # Update ball tracker with new positions
+    if front_ball_pos is not None or side_ball_pos is not None:
+        added_3d = ball_tracker.push_position(
+            frame_idx, front_ball_pos, side_ball_pos, 
+            front_ball_conf if front_ball_pos is not None else 0.0,
+            side_ball_conf if side_ball_pos is not None else 0.0
+        )
+        
+        if added_3d:
+            ball_detected = True
+    
+    #----------------------------------------------------------------------
+    # 6. TRAJECTORY CALCULATION AND VISUALIZATION
+    #----------------------------------------------------------------------
+    
+    # Get 3D positions for display
+    ball_positions_3d = ball_tracker.get_3d_positions()
+    
+    # Calculate trajectory using polynomial method
+    if len(ball_positions_3d) >= 5 and (impact_detected or in_flight):
+        # Apply trajectory calculation method
+        smooth_trajectory, calculated_carry, _ = calculate_trajectory_polynomial(
+            ball_positions_3d, fps
+        )
+        
+        if smooth_trajectory is not None and calculated_carry > 0:
+            # Update launch parameters
+            ls, la_v, la_h = calculate_launch_parameters_from_trajectory(ball_positions_3d, fps)
+            
+            # Only update if values are reasonable
+            if ls > 10.0:  # Minimum reasonable ball speed
+                launch_speed = ls
+                launch_angle_vertical = la_v
+                launch_angle_horizontal = la_h
+                predicted_carry = calculated_carry
+                
+                logging.info(f"Updated launch parameters using trajectory: speed={launch_speed:.2f}m/s, "
+                             f"vertical angle={launch_angle_vertical:.2f}°, "
+                             f"horizontal angle={launch_angle_horizontal:.2f}°, "
+                             f"carry={predicted_carry:.2f}m")
+    
+    # Draw actual 3D trajectory if available
+    if len(ball_positions_3d) > 1:
+        # Project 3D points back to both views
+        front_traj = []
+        side_traj = []
+        
+        for pos_3d in ball_positions_3d:
+            # Project 3D point to front view
+            front_point = calibration.project_3d_to_front(pos_3d)
+            front_traj.append((int(front_point[0]), int(front_point[1])))
+            
+            # Project 3D point to side view
+            side_point = calibration.project_3d_to_side(pos_3d)
+            side_traj.append((int(side_point[0]), int(side_point[1])))
+        
+        # Draw 3D trajectory on both views with thicker lines
+        for i in range(1, len(front_traj)):
+            pt1 = front_traj[i-1]
+            pt2 = front_traj[i]
+            # Fade-in effect
+            alpha = min(1.0, i / len(front_traj))
+            color = (0, int(255 * alpha), 0)
+            # Use thicker lines for trajectory
+            cv2.line(front_annotated, pt1, pt2, color, 3)
+        
+        for i in range(1, len(side_traj)):
+            pt1 = side_traj[i-1]
+            pt2 = side_traj[i]
+            # Fade-in effect
+            alpha = min(1.0, i / len(side_traj))
+            color = (0, int(255 * alpha), 0)
+            # Use thicker lines for trajectory
+            cv2.line(side_annotated, pt1, pt2, color, 3)
+        
+        # Add landing point markers for better visibility
+        if len(front_traj) > 2:
+            cv2.circle(front_annotated, front_traj[-1], 5, (0, 255, 255), -1)
+        if len(side_traj) > 2:
+            cv2.circle(side_annotated, side_traj[-1], 5, (0, 255, 255), -1)
+    
+    # If we don't have actual trajectory but have ball position and club speed,
+    # draw a predicted trajectory for visual feedback
+    elif ball_tracker.get_latest_3d_position() is not None and club_speed > 0:
+        # Generate a simple simulated trajectory based on club speed
+        start_pos = ball_tracker.get_latest_3d_position()
+        
+        # Simple simulated trajectory
+        default_angle = 12  # degrees
+        est_ball_speed = club_speed * SMASH_FACTOR
+        
+        # Calculate simple parabolic trajectory
+        simulated_traj = []
+        for t in np.linspace(0, 3, 30):  # 3 second flight, 30 points
+            # Simple physics model
+            x = start_pos[0] + est_ball_speed * math.cos(math.radians(default_angle)) * t
+            y = start_pos[1]  # Assume straight
+            z = start_pos[2] + est_ball_speed * math.sin(math.radians(default_angle)) * t - 0.5 * GRAVITY * t**2
+            if z < 0:  # Stop at ground level
+                break
+            simulated_traj.append((x, y, z))
+        
+        # Project and draw simulated trajectory
+        if simulated_traj:
+            front_sim_traj = []
+            side_sim_traj = []
+            
+            for pos_3d in simulated_traj:
+                # Project 3D point to both views
+                front_point = calibration.project_3d_to_front(pos_3d)
+                front_sim_traj.append((int(front_point[0]), int(front_point[1])))
+                
+                side_point = calibration.project_3d_to_side(pos_3d)
+                side_sim_traj.append((int(side_point[0]), int(side_point[1])))
+            
+            # Draw simulated trajectory as dotted line
+            for i in range(1, len(front_sim_traj)):
+                if i % 2 == 0:  # Skip every other point for dotted effect
+                    continue
+                pt1 = front_sim_traj[i-1]
+                pt2 = front_sim_traj[i]
+                # Use distinct color for simulated trajectory
+                cv2.line(front_annotated, pt1, pt2, (100, 100, 255), 2)
+            
+            for i in range(1, len(side_sim_traj)):
+                if i % 2 == 0:  # Skip every other point for dotted effect
+                    continue
+                pt1 = side_sim_traj[i-1]
+                pt2 = side_sim_traj[i]
+                # Use distinct color for simulated trajectory
+                cv2.line(side_annotated, pt1, pt2, (100, 100, 255), 2)
+            
+            # Mark landing points
+            if len(front_sim_traj) > 2:
+                cv2.drawMarker(front_annotated, front_sim_traj[-1], (100, 100, 255), 
+                              markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
+            if len(side_sim_traj) > 2:
+                cv2.drawMarker(side_annotated, side_sim_traj[-1], (100, 100, 255), 
+                              markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
+                
+            # Add a note that this is predicted trajectory
+            mid_idx = len(front_sim_traj)//2
+            if 0 <= mid_idx < len(front_sim_traj):
+                cv2.putText(front_annotated, "Predicted Flight", front_sim_traj[mid_idx], 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 255), 1)
+            
+            mid_idx = len(side_sim_traj)//2
+            if 0 <= mid_idx < len(side_sim_traj):
+                cv2.putText(side_annotated, "Predicted Flight", side_sim_traj[mid_idx], 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 255), 1)
+    
+    #----------------------------------------------------------------------
+    # 7. METRICS DISPLAY
+    #----------------------------------------------------------------------
+    
+    # Create background boxes for metrics display
+    metrics_height = 130
+    metrics_width = 250
+    
+    # Draw background boxes for better readability
+    draw_metrics_box(front_annotated, 10, 10, metrics_width, metrics_height)
+    draw_metrics_box(side_annotated, 10, 10, metrics_width, metrics_height)
+    
+    # ALWAYS display metrics if we have club speed
+    if club_speed > 0:
+        # Format horizontal angle correctly
+        horiz_angle_text = f"{launch_angle_horizontal:.1f}°"
+        
+        # Label showing if carry is estimated or measured
+        status_text = "ESTIMATED" if not impact_detected else "MEASURED"
+        
+        # Front view metrics
+        cv2.putText(front_annotated, f"Club Speed: {club_speed:.1f} m/s ({club_speed*2.237:.0f}mph)", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(front_annotated, f"Ball Speed: {launch_speed:.1f} m/s ({launch_speed*2.237:.0f}mph)", (15, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(front_annotated, f"Smash Factor: {SMASH_FACTOR:.2f}", (15, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(front_annotated, f"Horiz. Angle: {horiz_angle_text}", (15, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Make carry display more prominent - ALWAYS shown
+        cv2.putText(front_annotated, f"CARRY ({status_text}): {predicted_carry:.1f}m ({predicted_carry/METERS_PER_YARD:.0f}yd)", (15, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 255, 50), 2)
+        
+        # Side view metrics
+        cv2.putText(side_annotated, f"Club Speed: {club_speed:.1f} m/s ({club_speed*2.237:.0f}mph)", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(side_annotated, f"Ball Speed: {launch_speed:.1f} m/s ({launch_speed*2.237:.0f}mph)", (15, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(side_annotated, f"Launch Angle: {launch_angle_vertical:.1f}°", (15, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        cv2.putText(side_annotated, f"Smash Factor: {SMASH_FACTOR:.2f}", (15, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Make carry display more prominent - ALWAYS shown
+        cv2.putText(side_annotated, f"CARRY ({status_text}): {predicted_carry:.1f}m ({predicted_carry/METERS_PER_YARD:.0f}yd)", (15, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 255, 50), 2)
+    else:
+        # Display placeholder with more informative message
+        cv2.putText(front_annotated, "Calculating club speed and carry...", (15, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(side_annotated, "Calculating club speed and carry...", (15, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    #----------------------------------------------------------------------
+    # 8. STATUS DISPLAYS
+    #----------------------------------------------------------------------
+    
+    # Display tracking status on both views
+    status_msg = "Tracking: " + ("Active" if ball_detected else f"Lost ({ball_tracker.missed_frames})")
+    status_color = (0, 255, 0) if ball_detected else (255, 165, 0)
+    cv2.putText(front_annotated, status_msg, (10, 160),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+    cv2.putText(side_annotated, status_msg, (10, 160),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+    
+    # Show impact status with better visibility
+    if impact_detected:
+        cv2.putText(front_annotated, "IMPACT DETECTED", (10, 190),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)  # Orange-yellow for visibility
+        cv2.putText(side_annotated, "IMPACT DETECTED", (10, 190),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+    else:
+        cv2.putText(front_annotated, "Waiting for impact...", (10, 190),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)  # Grey for less prominence
+        cv2.putText(side_annotated, "Waiting for impact...", (10, 190),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+    
+    # Display swing state on both views
+    if swing_state == "SETUP":
+        setup_color = (0, 255, 255)  # Yellow
+    else:
+        setup_color = (128, 128, 0)  # Dark yellow/gold
+    
+    cv2.putText(front_annotated, swing_state, (10, 220),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, setup_color, 2)
+    cv2.putText(side_annotated, swing_state, (10, 220),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, setup_color, 2)
+    
+    #----------------------------------------------------------------------
+    # 9. COMBINED VIEW CREATION
+    #----------------------------------------------------------------------
+    
+    # Create combined view with standard size
+    combined_width = standard_width * 2  # 640 * 2 = 1280
+    combined = np.zeros((standard_height, combined_width, 3), dtype=np.uint8)
+    
+    # Place annotated frames in combined view
+    combined[:, :standard_width] = front_annotated
+    combined[:, standard_width:] = side_annotated
+    
+    # Add separating line
+    cv2.line(combined, (standard_width, 0), (standard_width, standard_height), (200, 200, 200), 2)
+    
+    # Add view labels
+    cv2.putText(combined, "Behind View", (20, standard_height - 10),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(combined, "Side View", (standard_width + 20, standard_height - 10),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    return combined, ball_detected
+
+
+###############################################################################
+# MAIN FUNCTION
+###############################################################################
+def main():
+    """
+    Main function that orchestrates the entire golf shot analysis process.
+    Handles video loading, shot detection, trajectory visualization, and result output.
+    """
+    global launch_speed, launch_angle_vertical, launch_angle_horizontal, predicted_carry, club_speed
+    
+    #----------------------------------------------------------------------
+    # 1. INITIALIZATION AND SETUP
+    #----------------------------------------------------------------------
+    
+    # Start timing for performance measurement
+    start_time = time.time()
+    
+    # Display welcome message
+    print("="*80)
+    print("FlightSight Pro Dual-Angle Golf Analysis")
+    print("="*80)
+    
+    # Initialize with placeholder values - these will be replaced
+    # with calculated values once impact is detected
+    launch_speed = 0.0 
+    launch_angle_vertical = 0.0
+    launch_angle_horizontal = 0.0
+    predicted_carry = 0.0
+    club_speed = 0.0
+    
+    # Create debug directory
+    if DEBUG_SAVE_FRAMES:
+        os.makedirs(DEBUG_FRAME_DIR, exist_ok=True)
+    
+    logging.info("Starting FlightSight Pro Dual-Angle Golf Analysis")
+    
+    #----------------------------------------------------------------------
+    # 2. LOAD MODEL AND CHECK VIDEOS
+    #----------------------------------------------------------------------
+    
+    # Load YOLO model
+    load_yolo_model()
+    
+    # Create camera calibration
+    calibration = GolfCameraCalibration(
+        CAMERA_MATRIX_FRONT, CAMERA_MATRIX_SIDE, CAMERA_OFFSET
+    )
+    
+    # Check input videos
+    if not os.path.isfile(FRONT_VIDEO_PATH):
+        logging.error(f"Front view video not found: {FRONT_VIDEO_PATH}")
+        return
+    
+    if not os.path.isfile(SIDE_VIDEO_PATH):
+        logging.error(f"Side view video not found: {SIDE_VIDEO_PATH}")
+        return
+    
+    #----------------------------------------------------------------------
+    # 3. OPEN VIDEOS AND SETUP ANALYSIS
+    #----------------------------------------------------------------------
+    
+    # Open video captures
+    front_cap = cv2.VideoCapture(FRONT_VIDEO_PATH)
+    side_cap = cv2.VideoCapture(SIDE_VIDEO_PATH)
+    
+    if not front_cap.isOpened():
+        logging.error(f"Could not open front video: {FRONT_VIDEO_PATH}")
+        return
+    
+    if not side_cap.isOpened():
+        logging.error(f"Could not open side video: {SIDE_VIDEO_PATH}")
+        front_cap.release()
+        return
+    
+    # Get video properties
+    front_fps = front_cap.get(cv2.CAP_PROP_FPS)
+    side_fps = side_cap.get(cv2.CAP_PROP_FPS)
+    
+    # Use minimum FPS for synchronization
+    fps = min(front_fps, side_fps)
+    if fps <= 0:
+        fps = TARGET_FPS
+    
+    # Setup output video with standard dimensions
+    standard_height = 480
+    standard_width = 640
+    combined_width = standard_width * 2  # 1280 pixels wide (2 views side by side)
+    
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"flightsight_pro_analysis_{timestamp}.mp4"
+    out = cv2.VideoWriter(output_path, fourcc, fps, (combined_width, standard_height))
+    
+    # Create trackers
+    ball_tracker = DualViewBallTracker(calibration)
+    club_tracker = DualViewEnhancedClubTracker(calibration)
+    swing_detector = SwingStateDetector()
+    
+    # Initialize state variables
+    in_flight = False
+    impact_detected = False
+    impact_frame = 0
+    frame_idx = 0
+    all_ball_positions_3d = []
+    
+    # Variables for frame differencing (research paper method)
+    front_background = None
+    side_background = None
+    prev_front_frame = None
+    prev_side_frame = None
+    
+    # Count total frames for progress reporting
+    total_frames = int(min(front_cap.get(cv2.CAP_PROP_FRAME_COUNT), 
+                          side_cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+    
+    #----------------------------------------------------------------------
+    # 4. INITIALIZE PROGRESS TRACKING
+    #----------------------------------------------------------------------
+    
+    # Process videos
+    print("Processing videos... This may take a few minutes. Progress will be reported every 30 frames.")
+    
+    #----------------------------------------------------------------------
+    # 5. MAIN PROCESSING LOOP
+    #----------------------------------------------------------------------
+    
+    while True:
+        # Clear GPU cache periodically to avoid memory fragmentation
+        if frame_idx % 100 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Read frames from both videos
+        front_ret, front_frame = front_cap.read()
+        side_ret, side_frame = side_cap.read()
+        
+        # Check if we've reached the end
+        if not front_ret or not side_ret:
+            logging.info(f"Reached end of videos at frame {frame_idx}")
+            break
+        
+        # Store background frames for motion detection
+        if frame_idx == 0:
+            front_background = front_frame.copy()
+            side_background = side_frame.copy()
+        
+        # Print progress
+        if frame_idx % 30 == 0:
+            percent_done = min(100, int(frame_idx / total_frames * 100))
+            print(f"Processing: {percent_done}% complete ({frame_idx}/{total_frames} frames)")
+            
+            # Display memory usage on GPU if available
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                memory_reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                print(f"  GPU memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+        
+        try:
+            # Skip frames for faster processing if needed (but don't skip at the beginning)
+            if PROCESS_INTERVAL > 1 and frame_idx % PROCESS_INTERVAL != 0 and frame_idx > 10:
+                frame_idx += 1
+                continue
+            
+            # Process frames (passing previous frames for motion detection)
+            combined_frame, ball_detected = process_frames(
+                front_frame, side_frame, frame_idx,
+                ball_tracker, club_tracker, swing_detector, calibration,
+                in_flight, impact_detected, fps,
+                front_background, prev_front_frame, prev_side_frame
+            )
+            
+            # Update previous frames
+            prev_front_frame = front_frame.copy() if front_frame is not None else None
+            prev_side_frame = side_frame.copy() if side_frame is not None else None
+            
+            # Save 3D positions for further analysis
+            latest_3d = ball_tracker.get_latest_3d_position()
+            if latest_3d is not None:
+                all_ball_positions_3d.append(latest_3d)
+            
+            #----------------------------------------------------------------------
+            # 6. IMPACT DETECTION (IMPROVED)
+            #----------------------------------------------------------------------
+            
+            if not impact_detected:
+                # Use wider frame window for slow motion
+                if frame_idx > IMPACT_DETECTION_WINDOW:
+                    # Calculate club head speed
+                    club_speed_calculated = club_tracker.get_club_speed_3d(fps)
+                    if club_speed_calculated > 0:
+                        club_speed = max(club_speed, club_speed_calculated)
+                    
+                    # Multiple impact detection methods with slow motion sensitivity:
+                    impact_conditions = []
+                    
+                    # 1. Lower club speed threshold for slow motion
+                    if club_speed > MIN_CLUB_SPEED_THRESHOLD:
+                        if (club_tracker.front_tracker.is_in_downswing() or 
+                            club_tracker.side_tracker.is_in_downswing()):
+                            impact_conditions.append("Club downswing detected")
+                    
+                    # 2. Lower confidence requirement for ball detection
+                    front_ball_bbox, front_ball_conf, _, _ = detect_objects(front_frame)
+                    side_ball_bbox, side_ball_conf, _, _ = detect_objects(side_frame)
+                    
+                    if (front_ball_bbox is not None and side_ball_bbox is not None and
+                        front_ball_conf > 0.3 and side_ball_conf > 0.3):
+                        impact_conditions.append("Ball detected in both views")
+                    
+                    # 3. Check for sustained swing state - more reliable in slow motion
+                    state_duration_threshold = int(3 * SLOW_MOTION_FACTOR)
+                    if (swing_detector.current_state in ["DOWNSWING"] and 
+                        swing_detector.time_in_state > state_duration_threshold):
+                        impact_conditions.append("Sustained downswing state")
+                    
+                    # 4. Detect even small ball movement in slow motion
+                    if len(ball_tracker.positions_3d) >= 3:
+                        first_pos = np.array(ball_tracker.positions_3d[0][1:4])
+                        current_pos = np.array(ball_tracker.positions_3d[-1][1:4])
+                        movement = np.linalg.norm(current_pos - first_pos)
+                        
+                        # Very sensitive threshold for slow motion
+                        if movement > 0.01:
+                            impact_conditions.append("Ball movement detected")
+                    
+                    # Impact detected if ANY condition met
+                    if impact_conditions:
+                        impact_detected = True
+                        impact_frame = frame_idx
+                        print(f"\nIMPACT DETECTED IN SLOW MOTION: {', '.join(impact_conditions)}")
+                        print(f"Club speed (adjusted): {club_speed:.2f} m/s ({club_speed*2.237:.1f} mph)")
+                        logging.info(f"Impact detected at frame {impact_frame}: {', '.join(impact_conditions)}")
+                        
+            #----------------------------------------------------------------------
+            # 7. FLIGHT DETECTION AND PARAMETER CALCULATION
+            #----------------------------------------------------------------------
+            
+            # Check for launch after impact
+            if impact_detected and not in_flight:
+                # Calculate club head speed if not already done
+                if club_speed < 1.0:
+                    club_speed = max(club_tracker.get_club_speed_3d(fps), 30.0)  # Use at least 30 m/s (~67mph)
+                
+                # Use club head speed to calculate ball speed and carry via smash factor
+                ball_speed, carry_distance = estimate_carry_using_smash_factor(club_speed)
+                
+                # Update global parameters
+                launch_speed = ball_speed
+                launch_angle_vertical = 12.0  # Typical driver launch angle
+                launch_angle_horizontal = -5.0  # Slight draw bias
+                predicted_carry = carry_distance
+                
+                print(f"\nGolf Shot Parameters Calculated:")
+                print(f"  Club Speed: {club_speed:.2f}m/s ({club_speed*2.237:.1f}mph)")
+                print(f"  Ball Speed: {ball_speed:.2f}m/s ({ball_speed*2.237:.1f}mph)")
+                print(f"  Smash Factor: {SMASH_FACTOR:.2f}")
+                print(f"  Launch Angle: {launch_angle_vertical:.1f}° vertical, {launch_angle_horizontal:.1f}° horizontal")
+                print(f"  Predicted Carry: {predicted_carry:.2f}m ({predicted_carry/METERS_PER_YARD:.1f}yd)")
+                
+                in_flight = True
+            
+            # Even if impact not detected yet, still update metrics for display
+            # whenever we have a good club speed value
+            if not impact_detected and club_speed > 0 and launch_speed == 0:
+                # Pre-calculate estimated ball speed and carry
+                ball_speed_est = club_speed * SMASH_FACTOR
+                carry_est = calculate_carry_from_ball_speed(ball_speed_est)
+                
+                # Set initial values
+                launch_speed = ball_speed_est
+                launch_angle_vertical = 12.0  # Typical default
+                launch_angle_horizontal = 0.0  # Neutral default
+                predicted_carry = carry_est
+                
+                print(f"\nESTIMATED Shot Parameters:")
+                print(f"  Club Speed: {club_speed:.2f}m/s ({club_speed*2.237:.1f}mph)")
+                print(f"  Est. Ball Speed: {launch_speed:.2f}m/s ({launch_speed*2.237:.1f}mph)")
+                print(f"  Est. Carry: {predicted_carry:.2f}m ({predicted_carry/METERS_PER_YARD:.1f}yd)")
+            
+            #----------------------------------------------------------------------
+            # 8. VIDEO SAVING AND DISPLAY
+            #----------------------------------------------------------------------
+            
+            # Write frame to output video
+            out.write(combined_frame)
+            
+            # Save debug frame if enabled
+            if DEBUG_SAVE_FRAMES and frame_idx % 10 == 0:
+                debug_frame_path = os.path.join(DEBUG_FRAME_DIR, f"frame_{frame_idx:04d}.jpg")
+                cv2.imwrite(debug_frame_path, combined_frame)
+            
+            # If displaying frames is enabled
+            if DISPLAY_FRAMES:
+                cv2.imshow("FlightSight Pro Analysis", combined_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or key == ord('q'):  # ESC or 'q' to quit
+                    break
+            
+            frame_idx += 1
+            
+        except Exception as e:
+            logging.error(f"Error processing frame {frame_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Try to continue with next frame
+            frame_idx += 1
+            continue
+    
+    #----------------------------------------------------------------------
+    # 9. CLEANUP AND RESULTS DISPLAY
+    #----------------------------------------------------------------------
+    
+    # Clean up
+    front_cap.release()
+    side_cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    
+    # Report processing statistics
+    end_time = time.time()
+    total_time = end_time - start_time
+    processing_fps = frame_idx / max(1, total_time)
+    print(f"\nProcessing complete: {frame_idx} frames in {total_time:.1f} seconds ({processing_fps:.1f} fps)")
+    print(f"Output video saved to: {output_path}")
+    
+    # Save a final snapshot with all metrics
+    if frame_idx > 0:
+        snapshot_filename = f"final_analysis_{timestamp}.jpg"
+        cv2.imwrite(snapshot_filename, combined_frame)
+        print(f"Final analysis snapshot saved to {snapshot_filename}")
+    
+    #----------------------------------------------------------------------
+    # 10. RESULTS SUMMARY AND VISUALIZATION
+    #----------------------------------------------------------------------
+    
+    # Display final results as text
+    print("\n" + "="*50)
+    print("Golf Shot Analysis Results")
+    print("="*50)
+    print(f"Club Speed: {club_speed:.2f} m/s ({club_speed*2.237:.2f} mph)")
+    print(f"Ball Speed: {launch_speed:.2f} m/s ({launch_speed*2.237:.2f} mph)")
+    print(f"Smash Factor: {SMASH_FACTOR:.2f}")
+    print(f"Vertical Launch Angle: {launch_angle_vertical:.2f}°")
+    print(f"Horizontal Launch Angle: {launch_angle_horizontal:.2f}°")
+    print(f"Estimated Carry Distance: {predicted_carry:.2f} m ({predicted_carry/METERS_PER_YARD:.2f} yards)")
+    print("="*50)
+    
+    # Calculate and visualize trajectory if enough data is available
+    if len(all_ball_positions_3d) >= 5:
+        smooth_trajectory, final_carry, _ = calculate_trajectory_polynomial(
+            all_ball_positions_3d, fps
+        )
+        
+        if smooth_trajectory is not None:
+            print(f"\nTrajectory calculation complete.")
+            print(f"Final estimated carry: {final_carry:.2f}m ({final_carry/METERS_PER_YARD:.2f} yards)")
+            
+            # Plot 3D trajectory
+            plot_3d_trajectory(smooth_trajectory, 
+                             title=f"Golf Ball Trajectory - Carry: {final_carry:.1f}m ({final_carry/METERS_PER_YARD:.1f} yards)")
+    
+    # Even if we don't have actual trajectory data, we can still show metrics visualization
+    plot_launch_parameters(
+        club_speed,
+        launch_speed,
+        SMASH_FACTOR,
+        launch_angle_vertical,
+        launch_angle_horizontal,
+        predicted_carry
+    )
+    
+    return {
+        'club_speed_ms': club_speed,
+        'club_speed_mph': club_speed * 2.237,
+        'ball_speed_ms': launch_speed,
+        'ball_speed_mph': launch_speed * 2.237,
+        'smash_factor': SMASH_FACTOR,
+        'vertical_angle': launch_angle_vertical,
+        'horizontal_angle': launch_angle_horizontal,
+        'carry_distance_m': predicted_carry,
+        'carry_distance_yards': predicted_carry/METERS_PER_YARD
+    }
+    
+
+if __name__ == "__main__":
+    main()
